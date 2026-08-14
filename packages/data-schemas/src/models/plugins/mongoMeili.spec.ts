@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import { EModelEndpoint } from 'librechat-data-provider';
 import { MongoMemoryServer } from 'mongodb-memory-server';
+import meiliLogger from '~/config/meiliLogger';
 import mongoMeili, { type SchemaWithMeiliMethods } from '~/models/plugins/mongoMeili';
 import { createConversationModel } from '~/models/convo';
 import { createMessageModel } from '~/models/message';
@@ -1208,7 +1209,10 @@ describe('Meilisearch Mongoose plugin', () => {
 
       rejectMeiliWrite!(new Error('Network error'));
       await waitForMockCalls(mockAddDocuments, 2);
-      await wait(25);
+      await waitForCondition(async () => {
+        const storedDoc = await conversationModel.collection.findOne({ _id: conversation._id });
+        return storedDoc?._meiliIndex === true && storedDoc?._meiliIndexAttempted === true;
+      });
 
       const storedConversation = await conversationModel.collection.findOne({
         _id: conversation._id,
@@ -1223,6 +1227,8 @@ describe('Meilisearch Mongoose plugin', () => {
       const conversationModel = createConversationModel(
         mongoose,
       ) as unknown as SchemaWithMeiliMethods;
+      const finalError = new Error('Final network error');
+      const errorSpy = jest.spyOn(meiliLogger, 'error').mockImplementation(() => meiliLogger);
       await conversationModel.deleteMany({});
 
       const conversation = await conversationModel.create({
@@ -1232,11 +1238,14 @@ describe('Meilisearch Mongoose plugin', () => {
         endpoint: EModelEndpoint.openAI,
       });
       await waitForMock(mockAddDocuments);
-      await wait(25);
+      await waitForCondition(async () => {
+        const storedDoc = await conversationModel.collection.findOne({ _id: conversation._id });
+        return storedDoc?._meiliIndex === true;
+      });
       mockUpdateDocuments
         .mockRejectedValueOnce(new Error('Network error'))
         .mockRejectedValueOnce(new Error('Network error'))
-        .mockRejectedValueOnce(new Error('Network error'));
+        .mockRejectedValueOnce(finalError);
 
       conversation._meiliIndex = true;
       conversation.title = 'Updated Conversation';
@@ -1246,11 +1255,21 @@ describe('Meilisearch Mongoose plugin', () => {
         (await conversationModel.collection.findOne({ _id: conversation._id }))?._meiliIndex,
       ).toBe(false);
       await waitForMockCalls(mockUpdateDocuments, 3);
-      await wait(25);
+      await waitForCondition(() =>
+        errorSpy.mock.calls.some(
+          ([message, error]) =>
+            message === '[updateObjectToMeili] Error updating document in Meili:' &&
+            error === finalError,
+        ),
+      );
 
       const storedConversation = await conversationModel.collection.findOne({
         _id: conversation._id,
       });
+      expect(errorSpy).toHaveBeenCalledWith(
+        '[updateObjectToMeili] Error updating document in Meili:',
+        finalError,
+      );
       expect(mockUpdateDocuments).toHaveBeenCalledTimes(3);
       expect(storedConversation?._meiliIndex).toBe(false);
       expect(storedConversation?._meiliIndexAttempted).toBe(true);
@@ -1286,13 +1305,21 @@ describe('Meilisearch Mongoose plugin', () => {
             _meiliIndex: true,
             _meiliIndexAttempted: true,
             _meiliIndexVersion: latestVersion,
+            _meiliCleanupVersion: 0,
           },
         },
       );
 
       resolveStaleWrite!({ taskUid: 1 });
       await waitForMockCalls(mockAddDocuments, 2);
-      await wait(25);
+      await waitForCondition(async () => {
+        const storedDoc = await conversationModel.collection.findOne({ _id: conversation._id });
+        return (
+          storedDoc?._meiliIndex === true &&
+          storedDoc?._meiliIndexVersion === latestVersion &&
+          storedDoc?._meiliCleanupVersion === 1
+        );
+      });
 
       expect(mockAddDocuments.mock.calls[1]).toEqual([
         [expect.objectContaining({ title: 'Latest Replica Snapshot' })],
@@ -1301,6 +1328,7 @@ describe('Meilisearch Mongoose plugin', () => {
       expect(await conversationModel.collection.findOne({ _id: conversation._id })).toMatchObject({
         _meiliIndex: true,
         _meiliIndexVersion: latestVersion,
+        _meiliCleanupVersion: 1,
       });
     });
 
