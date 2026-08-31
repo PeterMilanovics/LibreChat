@@ -712,7 +712,7 @@ const processAgentFileUpload = async ({ req, res, metadata, sseStream, uploadAge
     messageAttachment,
     fileConfig,
   });
-  const { endpoint, endpointConfig, llmDeliveryPath } = routing;
+  const { llmDeliveryPath } = routing;
   let effectiveToolResource = routing.effectiveToolResource;
 
   if (routing.requiresExplicitToolResource) {
