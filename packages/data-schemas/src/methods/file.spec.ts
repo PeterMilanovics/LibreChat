@@ -705,6 +705,234 @@ describe('File Methods', () => {
     });
   });
 
+  describe('getDeferredProvisionFiles', () => {
+    const makeFile = (
+      fileId: string,
+      ownerId: mongoose.Types.ObjectId,
+      overrides: Record<string, unknown> = {},
+    ) =>
+      runAsSystem(() =>
+        fileMethods.createFile({
+          file_id: fileId,
+          user: ownerId,
+          tenantId: 'tenant-a',
+          conversationId: 'conversation-a',
+          filename: `${fileId}.csv`,
+          filepath: `/uploads/${fileId}.csv`,
+          source: 'local',
+          type: 'text/csv',
+          bytes: 100,
+          context: FileContext.message_attachment,
+          ...overrides,
+        }),
+      );
+
+    it('returns attachments that carry neither an embedding nor a code reference', async () => {
+      const ownerId = new mongoose.Types.ObjectId();
+      const deferredId = uuidv4();
+      await makeFile(deferredId, ownerId);
+
+      const results = await fileMethods.getDeferredProvisionFiles([deferredId], {
+        userId: ownerId.toString(),
+        tenantId: 'tenant-a',
+      });
+
+      expect(results.map((file) => file.file_id)).toEqual([deferredId]);
+    });
+
+    it('omits a file that already carries every requested result', async () => {
+      const ownerId = new mongoose.Types.ObjectId();
+      const embeddedId = uuidv4();
+      const provisionedId = uuidv4();
+      const generatedId = uuidv4();
+      await makeFile(embeddedId, ownerId, {
+        embedded: true,
+        metadata: {
+          codeEnvRef: {
+            kind: 'user',
+            id: ownerId.toString(),
+            storage_session_id: 'session',
+            file_id: embeddedId,
+          },
+        },
+      });
+      await makeFile(provisionedId, ownerId, {
+        embedded: true,
+        metadata: {
+          codeEnvRef: {
+            kind: 'user',
+            id: ownerId.toString(),
+            storage_session_id: 'session',
+            file_id: provisionedId,
+          },
+        },
+      });
+      await makeFile(generatedId, ownerId, { context: FileContext.execute_code });
+
+      const results = await fileMethods.getDeferredProvisionFiles(
+        [embeddedId, provisionedId, generatedId],
+        { userId: ownerId.toString(), tenantId: 'tenant-a' },
+      );
+
+      expect(results).toEqual([]);
+    });
+
+    it('returns a search-embedded file when the agent needs code provisioning', async () => {
+      const ownerId = new mongoose.Types.ObjectId();
+      const embeddedOnlyId = uuidv4();
+      await makeFile(embeddedOnlyId, ownerId, { embedded: true });
+
+      const forCode = await fileMethods.getDeferredProvisionFiles(
+        [embeddedOnlyId],
+        { userId: ownerId.toString(), tenantId: 'tenant-a' },
+        { code: true },
+      );
+      const forSearch = await fileMethods.getDeferredProvisionFiles(
+        [embeddedOnlyId],
+        { userId: ownerId.toString(), tenantId: 'tenant-a' },
+        { search: true },
+      );
+
+      expect(forCode.map((file) => file.file_id)).toEqual([embeddedOnlyId]);
+      expect(forSearch).toEqual([]);
+    });
+
+    it('returns a code-provisioned file when the agent needs search provisioning', async () => {
+      const ownerId = new mongoose.Types.ObjectId();
+      const codeOnlyId = uuidv4();
+      await makeFile(codeOnlyId, ownerId, {
+        metadata: {
+          codeEnvRef: {
+            kind: 'user',
+            id: ownerId.toString(),
+            storage_session_id: 'session',
+            file_id: codeOnlyId,
+          },
+        },
+      });
+
+      const forSearch = await fileMethods.getDeferredProvisionFiles(
+        [codeOnlyId],
+        { userId: ownerId.toString(), tenantId: 'tenant-a' },
+        { search: true },
+      );
+      const forCode = await fileMethods.getDeferredProvisionFiles(
+        [codeOnlyId],
+        { userId: ownerId.toString(), tenantId: 'tenant-a' },
+        { code: true },
+      );
+
+      expect(forSearch.map((file) => file.file_id)).toEqual([codeOnlyId]);
+      expect(forCode).toEqual([]);
+    });
+
+    it('does not cross the authenticated owner scope', async () => {
+      const ownerId = new mongoose.Types.ObjectId();
+      const victimId = new mongoose.Types.ObjectId();
+      const victimFileId = uuidv4();
+      await makeFile(victimFileId, victimId);
+
+      const results = await fileMethods.getDeferredProvisionFiles([victimFileId], {
+        userId: ownerId.toString(),
+        tenantId: 'tenant-a',
+      });
+
+      expect(results).toEqual([]);
+    });
+  });
+
+  describe('updateFileCodeEnvRef', () => {
+    const makeRefFile = (fileId: string, ownerId: mongoose.Types.ObjectId) =>
+      runAsSystem(() =>
+        fileMethods.createFile({
+          file_id: fileId,
+          user: ownerId,
+          tenantId: 'tenant-a',
+          conversationId: 'conversation-a',
+          filename: `${fileId}.csv`,
+          filepath: `/uploads/${fileId}.csv`,
+          source: 'local',
+          type: 'text/csv',
+          bytes: 100,
+          context: FileContext.message_attachment,
+          metadata: { sourceDispatchedAt: 42 },
+        }),
+      );
+
+    const ref = (routeKey: string, remoteId: string) => ({
+      kind: 'user' as const,
+      id: 'u1',
+      storage_session_id: `session-${routeKey}`,
+      file_id: remoteId,
+      executionRouteKey: routeKey,
+    });
+
+    it('keeps concurrently written sibling routes', async () => {
+      const ownerId = new mongoose.Types.ObjectId();
+      const fileId = uuidv4();
+      await makeRefFile(fileId, ownerId);
+
+      await Promise.all([
+        runAsSystem(() =>
+          fileMethods.updateFileCodeEnvRef({
+            file_id: fileId,
+            routeKey: 'default',
+            ref: ref('default', 'remote-default'),
+          }),
+        ),
+        runAsSystem(() =>
+          fileMethods.updateFileCodeEnvRef({
+            file_id: fileId,
+            routeKey: 'stateful:a',
+            ref: ref('stateful:a', 'remote-stateful'),
+          }),
+        ),
+      ]);
+
+      const stored = await runAsSystem(() => fileMethods.findFileById(fileId));
+      const refs = stored?.metadata?.codeEnvRefs as Record<string, { file_id: string }> | undefined;
+      expect(refs?.default?.file_id).toBe('remote-default');
+      expect(refs?.['stateful:a']?.file_id).toBe('remote-stateful');
+    });
+
+    it('leaves sibling metadata fields in place', async () => {
+      const ownerId = new mongoose.Types.ObjectId();
+      const fileId = uuidv4();
+      await makeRefFile(fileId, ownerId);
+
+      await runAsSystem(() =>
+        fileMethods.updateFileCodeEnvRef({
+          file_id: fileId,
+          routeKey: 'default',
+          ref: ref('default', 'remote-default'),
+          legacyRef: ref('default', 'remote-default'),
+        }),
+      );
+
+      const stored = await runAsSystem(() => fileMethods.findFileById(fileId));
+      expect(stored?.metadata?.sourceDispatchedAt).toBe(42);
+      expect((stored?.metadata?.codeEnvRef as { file_id: string } | undefined)?.file_id).toBe(
+        'remote-default',
+      );
+    });
+
+    it('rejects a route key that would write outside its entry', async () => {
+      const ownerId = new mongoose.Types.ObjectId();
+      const fileId = uuidv4();
+      await makeRefFile(fileId, ownerId);
+
+      await expect(
+        runAsSystem(() =>
+          fileMethods.updateFileCodeEnvRef({
+            file_id: fileId,
+            routeKey: 'a.b',
+            ref: ref('a.b', 'remote'),
+          }),
+        ),
+      ).rejects.toThrow(/Invalid code environment route key/);
+    });
+  });
+
   describe('getUserCodeFiles', () => {
     it('returns only authenticated owner code-env uploads', async () => {
       const ownerId = new mongoose.Types.ObjectId();

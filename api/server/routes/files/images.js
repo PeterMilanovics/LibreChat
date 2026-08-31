@@ -22,6 +22,7 @@ const {
 const {
   processAgentFileUpload,
   processImageFile,
+  resolvesToTextDelivery,
   filterFile,
 } = require('~/server/services/Files/process');
 const { hasCapability } = require('~/server/middleware/roles/capabilities');
@@ -66,18 +67,22 @@ router.post('/', async (req, res) => {
 
     filterFile({ req, image: true, endpointConfig: uploadRouting?.endpointConfig });
 
-    /* Only the agent-upload path performs extraction, so only it may present the
-     * promoted resource here. Handing a promoted `context` to an upload that falls
-     * through to `processImageFile` would defer a fail-closed policy on the promise
-     * of an OCR pass that never runs. */
-    const routesToAgentUpload = isAgentUpload && metadata.tool_resource != null;
+    /* An image the config routes to text delivery has to go through the agent upload
+     * path, which extracts and stores the text. The image pipeline would persist the
+     * routing without any text, leaving the file out of provider delivery and out of
+     * the text context both. */
+    const takesAgentUploadPath =
+      metadata.tool_resource != null || (await resolvesToTextDelivery({ req, metadata }));
 
     await assertUploadContentAllowed({
       filters: req.config?.filters,
       file: req.file,
       endpoint: uploadRouting?.endpoint ?? metadata.endpoint,
+      /* Only the path that extracts may be shown the promoted resource: an upload
+       * falling through to `processImageFile` runs no OCR, so deferring a fail-closed
+       * policy there would accept it uninspected. */
       toolResource:
-        uploadRouting && routesToAgentUpload
+        uploadRouting && takesAgentUploadPath
           ? uploadRouting.effectiveToolResource
           : metadata.tool_resource,
       fileConfig: mergeFileConfig(req.config?.fileConfig),
@@ -121,7 +126,7 @@ router.post('/', async (req, res) => {
       }
     }
 
-    if (isAgentUpload && metadata.tool_resource != null) {
+    if (isAgentUpload && takesAgentUploadPath) {
       openSseStreamIfRequested();
       return await processAgentFileUpload({ req, res, metadata, sseStream, uploadAgent });
     }

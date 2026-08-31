@@ -1,5 +1,6 @@
 import { EToolResources, FileContext } from 'librechat-data-provider';
 import type { FilterQuery, SortOrder, Model } from 'mongoose';
+import type { CodeEnvRef } from 'librechat-data-provider';
 import type { IMongoFile } from '~/types/file';
 import { tenantSafeBulkWrite } from '~/utils/tenantBulkWrite';
 import logger from '../config/winston';
@@ -47,6 +48,11 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
     ownerScope?: FileOwnerScope,
   ) => Promise<IMongoFile[]>;
   getUserCodeFiles: (fileIds: string[], ownerScope: FileOwnerScope) => Promise<IMongoFile[]>;
+  getDeferredProvisionFiles: (
+    fileIds: string[],
+    ownerScope: FileOwnerScope,
+    resources?: { code?: boolean; search?: boolean },
+  ) => Promise<IMongoFile[]>;
   claimCodeFile: (data: {
     filename: string;
     conversationId: string;
@@ -268,6 +274,75 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
   }
 
   /**
+   * Retrieves conversation attachments that were accepted but never provisioned, so a
+   * later turn can still queue them.
+   *
+   * Lazy provisioning defers the upload to the sandbox or vector store until a tool
+   * actually runs. The other hydration queries only return files that already carry
+   * the result of that work: `getToolFilesByIds` matches `embedded: true` for
+   * file_search, and `getUserCodeFiles` requires an existing `codeEnvRef`. A file
+   * whose tool was never called on its upload turn therefore satisfies neither and
+   * disappears. This fills exactly that gap: attachments with no code reference and
+   * no embedding.
+   *
+   * Kept separate from delivery hydration deliberately. These records are candidates
+   * for provisioning only; feeding them back into the model's attachments would
+   * re-send earlier uploads on every subsequent turn.
+   *
+   * Selection is per requested resource, not per file. A file embedded for an earlier
+   * file_search agent still has no code reference, so a later execute_code agent must
+   * see it; requiring both results to be absent would hide exactly that case.
+   *
+   * @param fileIds - Candidate file IDs from the current thread
+   * @param ownerScope - Authenticated owner scope
+   * @param resources - Which provisioning results the current agent needs
+   * @returns Attachments still awaiting a result the current agent needs
+   */
+  async function getDeferredProvisionFiles(
+    fileIds: string[],
+    ownerScope: FileOwnerScope,
+    resources: { code?: boolean; search?: boolean } = { code: true, search: true },
+  ): Promise<IMongoFile[]> {
+    if (!fileIds || fileIds.length === 0) {
+      return [];
+    }
+
+    const missingConditions: FilterQuery<IMongoFile>[] = [];
+    if (resources.code) {
+      missingConditions.push({
+        'metadata.codeEnvRef': { $exists: false },
+        'metadata.codeEnvRefs': { $exists: false },
+      });
+    }
+    if (resources.search) {
+      missingConditions.push({ embedded: { $ne: true } });
+    }
+    if (missingConditions.length === 0) {
+      return [];
+    }
+
+    try {
+      const filter = withOwnerScope(
+        {
+          file_id: { $in: fileIds },
+          context: { $ne: FileContext.execute_code },
+          $or: missingConditions,
+        },
+        ownerScope,
+      );
+
+      const selectFields: SelectProjection = { text: 0 };
+      const sortOptions = { createdAt: 1 as SortOrder };
+
+      const results = await getFiles(filter, sortOptions, selectFields);
+      return results ?? [];
+    } catch (error) {
+      logger.error('[getDeferredProvisionFiles] Error retrieving deferred files:', error);
+      return [];
+    }
+  }
+
+  /**
    * Retrieves user-uploaded execute_code files (not code-generated) by their file IDs.
    * These are files with fileIdentifier metadata but context is NOT execute_code (e.g., agents or message_attachment).
    * File IDs should be collected from message.files arrays in the current thread.
@@ -412,6 +487,42 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
     return File.findOneAndUpdate(query, updateOperation, {
       new: true,
     }).lean<IMongoFile>();
+  }
+
+  /**
+   * Records one code-environment route pointer without rewriting the rest of `metadata`.
+   * Agents provisioning the same file to different deployments write concurrently, and a
+   * whole-object `$set` built from each caller's pre-provisioning snapshot would drop the
+   * sibling route that landed in between.
+   *
+   * @param data - The file, its route key, the pointer to store, and an optional legacy pointer
+   * @returns A promise that resolves to the updated file document, or null when absent
+   */
+  async function updateFileCodeEnvRef(data: {
+    file_id: string;
+    routeKey: string;
+    ref: CodeEnvRef;
+    legacyRef?: CodeEnvRef;
+  }): Promise<IMongoFile | null> {
+    const { file_id, routeKey, ref, legacyRef } = data;
+    /* Route keys become dotted update paths, so a key carrying `.` or a leading `$` would
+     * write somewhere other than the intended entry. They come from server config, which
+     * makes a malformed one a configuration error worth surfacing. */
+    if (routeKey.length === 0 || routeKey.includes('.') || routeKey.startsWith('$')) {
+      throw new Error(`Invalid code environment route key "${routeKey}"`);
+    }
+    const File = mongoose.models.File as Model<IMongoFile>;
+    const update: Record<string, CodeEnvRef> = {
+      [`metadata.codeEnvRefs.${routeKey}`]: ref,
+    };
+    if (legacyRef) {
+      update['metadata.codeEnvRef'] = legacyRef;
+    }
+    return File.findOneAndUpdate(
+      { file_id },
+      { $set: update, $unset: { expiresAt: '' } },
+      { new: true },
+    ).lean<IMongoFile>();
   }
 
   /**
@@ -682,9 +793,11 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
     getToolFilesByIds,
     getCodeGeneratedFiles,
     getUserCodeFiles,
+    getDeferredProvisionFiles,
     claimCodeFile,
     createFile,
     updateFile,
+    updateFileCodeEnvRef,
     updateFileUsage,
     deleteFile,
     deleteFiles,

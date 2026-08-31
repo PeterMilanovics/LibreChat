@@ -72,6 +72,13 @@ import {
   isContentTraversalLimitError,
 } from '../protection/adapters/nested';
 import {
+  optionalChainWithEmptyCheck,
+  extractLibreChatParams,
+  getSafeErrorMetadata,
+  getModelMaxTokens,
+  getThreadData,
+} from '~/utils';
+import {
   normalizeServerName,
   requiresEphemeralUserConnection,
   splitMCPToolKey,
@@ -82,12 +89,6 @@ import {
   resolveCodeExecutionContext,
   type CodeExecutionContext,
 } from './execution';
-import {
-  optionalChainWithEmptyCheck,
-  extractLibreChatParams,
-  getModelMaxTokens,
-  getThreadData,
-} from '~/utils';
 import {
   registerCodeExecutionTools,
   registerFileAuthoringTools,
@@ -675,6 +676,11 @@ export interface InitializeAgentDbMethods extends EndpointDbMethods {
   ) => Promise<unknown[]>;
   /** Get user-uploaded execute_code files by file IDs (from message.files in thread) */
   getUserCodeFiles?: (fileIds: string[], ownerScope: FileOwnerScope) => Promise<unknown[]>;
+  getDeferredProvisionFiles?: (
+    fileIds: string[],
+    ownerScope: FileOwnerScope,
+    resources?: { code?: boolean; search?: boolean },
+  ) => Promise<unknown[]>;
   /** Get messages for a conversation (supports select for field projection) */
   getMessages?: (
     filter: { conversationId: string },
@@ -1015,6 +1021,9 @@ export async function initializeAgent(
     ),
   ];
   const toolFileIds: string[] = [];
+  /** Earlier-turn attachments still awaiting provisioning; provisioning input only. */
+  let deferredProvisionFiles: IMongoFile[] = [];
+  let deferredProvisionFileIds: string[] = [];
 
   /** Build the set of tool resources the agent has enabled */
   const toolResourceSet = new Set<EToolResources>();
@@ -1030,15 +1039,22 @@ export async function initializeAgent(
    * in the conversation. Without this, file_search and execute_code tools
    * on handoff agents would fail to find previously attached files.
    */
-  if (conversationId != null && resendFiles) {
+  /* `resendFiles` governs whether earlier attachments are sent to the model again, so
+   * it gates the delivery queries below. Deferred provisioning candidates are already
+   * excluded from delivery, and a sandbox or search call still needs its inputs, so
+   * that lookup runs whichever way the setting is configured. */
+  const wantsCodeFiles = toolResourceSet.has(EToolResources.execute_code);
+  const wantsSearchFiles = toolResourceSet.has(EToolResources.file_search);
+  const wantsProvisioning = wantsCodeFiles || wantsSearchFiles;
+
+  if (conversationId != null && (resendFiles || wantsProvisioning)) {
     const getThreadMessages = db.getMessages;
     /** Falsy anchors cannot match a parent chain, so they get no walk. */
     const threadAnchor =
       parentMessageId && parentMessageId !== Constants.NO_PARENT ? parentMessageId : null;
-    const needsThreadWalk =
-      toolResourceSet.has(EToolResources.execute_code) &&
-      threadAnchor != null &&
-      getThreadMessages != null;
+    /* Either provisioning resource needs the anchor: deferred attachments for
+     * file_search are found by thread file ids just as code files are. */
+    const needsThreadWalk = wantsProvisioning && threadAnchor != null && getThreadMessages != null;
 
     /**
      * The conversation's file refs and the thread walk share no inputs, so they resolve
@@ -1069,6 +1085,13 @@ export async function initializeAgent(
         ? getThreadData(threadMessages, threadAnchor).fileIds
         : undefined;
 
+    /* Linear continuation APIs supply no anchor: the Responses API always continues via
+     * `previous_response_id`, and chat completions may send `conversation_id` alone. There
+     * is no branch to walk in either case, so the conversation's own file refs are both the
+     * correct scope and the only one available. Without this the deferred lookup never runs
+     * there, and a later code or search call executes without the attachment. */
+    const provisionFileIds = threadFileIds && threadFileIds.length > 0 ? threadFileIds : fileIds;
+
     /**
      * Retrieve execute_code files filtered to the current thread.
      * This includes both code-generated files and user-uploaded execute_code files.
@@ -1079,20 +1102,24 @@ export async function initializeAgent(
      * both on `threadFileIds` reaches files regardless of which sibling first generated
      * them — see `getCodeGeneratedFiles` for the branched-conversation rationale.
      */
-    const wantsCodeFiles = toolResourceSet.has(EToolResources.execute_code);
-    const [toolFiles, codeGeneratedFiles, userCodeFiles] = await Promise.all([
-      requestFileOwnerScope
+    /* Attachments accepted on an earlier turn whose tool never ran are absent from the
+     * three queries below, since those match only files that already carry the result
+     * of provisioning. Fetched alongside them, not after: it is independent of all
+     * three, and this runs on the agent initialization path. */
+    const [toolFiles, codeGeneratedFiles, userCodeFiles, deferredFiles] = await Promise.all([
+      resendFiles && requestFileOwnerScope
         ? (db.getToolFilesByIds(fileIds, toolResourceSet, requestFileOwnerScope) as Promise<
             IMongoFile[]
           >)
         : ([] as IMongoFile[]),
-      wantsCodeFiles && db.getCodeGeneratedFiles && requestFileOwnerScope
+      resendFiles && wantsCodeFiles && db.getCodeGeneratedFiles && requestFileOwnerScope
         ? (db.getCodeGeneratedFiles(
             conversationId,
             threadFileIds,
             requestFileOwnerScope,
           ) as Promise<IMongoFile[]>)
         : ([] as IMongoFile[]),
+      resendFiles &&
       wantsCodeFiles &&
       db.getUserCodeFiles &&
       requestFileOwnerScope &&
@@ -1100,7 +1127,23 @@ export async function initializeAgent(
       threadFileIds.length > 0
         ? (db.getUserCodeFiles(threadFileIds, requestFileOwnerScope) as Promise<IMongoFile[]>)
         : ([] as IMongoFile[]),
+      wantsProvisioning &&
+      db.getDeferredProvisionFiles &&
+      requestFileOwnerScope &&
+      provisionFileIds.length > 0
+        ? (db.getDeferredProvisionFiles(provisionFileIds, requestFileOwnerScope, {
+            code: wantsCodeFiles,
+            search: wantsSearchFiles,
+          }) as Promise<IMongoFile[]>)
+        : ([] as IMongoFile[]),
     ]);
+
+    /* Ids only: these are hydrated with the request's own files below so the same
+     * content policy applies before their bytes can reach the Code API or RAG. They
+     * are kept out of the delivery set, not out of inspection. */
+    deferredProvisionFileIds = deferredFiles
+      .map((file) => file.file_id)
+      .filter((fileId): fileId is string => typeof fileId === 'string');
 
     const allToolFiles = toolFiles.concat(codeGeneratedFiles, userCodeFiles);
     const snapshotFileIds = new Set(requestFileIds);
@@ -1121,7 +1164,7 @@ export async function initializeAgent(
    * keep this exact snapshot authoritative for inspection, priming, and the
    * later usage update to avoid a post-inspection re-read.
    */
-  const snapshotFileIds = [...requestFileIds, ...toolFileIds];
+  const snapshotFileIds = [...requestFileIds, ...toolFileIds, ...deferredProvisionFileIds];
   let requestUsageFiles: IMongoFile[] = [];
   let toolUsageFiles: IMongoFile[] = [];
   if (requestFileOwnerScope && snapshotFileIds.length > 0) {
@@ -1148,28 +1191,64 @@ export async function initializeAgent(
     toolUsageFiles = toolFileIds
       .map((fileId) => hydratedFilesById.get(fileId))
       .filter((file): file is IMongoFile => file != null);
+    deferredProvisionFiles = deferredProvisionFileIds
+      .map((fileId) => hydratedFilesById.get(fileId))
+      .filter((file): file is IMongoFile => file != null);
   }
   if (requestFiles.length > 0 || toolFileIds.length > 0) {
     currentFiles = requestUsageFiles.concat(toolUsageFiles);
   }
 
-  if (currentFiles && currentFiles.length) {
+  if ((currentFiles && currentFiles.length) || deferredProvisionFiles.length > 0) {
     let endpointType: EModelEndpoint | undefined;
     if (!paramEndpoints.has(agent.endpoint ?? '')) {
       endpointType = EModelEndpoint.custom;
     }
 
-    currentFiles = filterFilesByEndpointRuntimeConfig(appConfig, {
-      files: currentFiles,
-      endpoint: agent.endpoint ?? '',
-      endpointType,
-    });
+    if (currentFiles && currentFiles.length) {
+      currentFiles = filterFilesByEndpointRuntimeConfig(appConfig, {
+        files: currentFiles,
+        endpoint: agent.endpoint ?? '',
+        endpointType,
+      });
+    }
+
+    /* The same endpoint configuration governs both paths. A file this endpoint refuses
+     * by size, MIME type, or a files-disabled setting must not reach the Code API or
+     * RAG through provisioning just because it left the delivery set. */
+    if (deferredProvisionFiles.length > 0) {
+      deferredProvisionFiles = filterFilesByEndpointRuntimeConfig(appConfig, {
+        files: deferredProvisionFiles,
+        endpoint: agent.endpoint ?? '',
+        endpointType,
+      }) as IMongoFile[];
+    }
   }
 
   assertModelBoundContent({
     filters: appConfig?.filters,
     files: currentFiles,
   });
+
+  /* Provisioning candidates are inspected under the same policy before their bytes can
+   * be sent to the Code API or RAG. A violator is dropped rather than failing the turn:
+   * these were not attached by this request, and before deferred hydration existed they
+   * were simply absent, so refusing the conversation over a historical record would be
+   * a harsher outcome than the one this change replaced. */
+  if (deferredProvisionFiles.length > 0) {
+    deferredProvisionFiles = deferredProvisionFiles.filter((file) => {
+      try {
+        assertModelBoundContent({ filters: appConfig?.filters, files: [file] });
+        return true;
+      } catch (error) {
+        logger.warn(
+          `[initializeAgent] Skipping provisioning for "${file.filename}" (${file.file_id}): content policy`,
+          getSafeErrorMetadata(error),
+        );
+        return false;
+      }
+    });
+  }
 
   /**
    * Usage accounting is the first file mutation. It runs only after every
@@ -1212,6 +1291,7 @@ export async function initializeAgent(
     enabledToolResources: toolResourceSet,
     checkSessionsAlive: db.checkSessionsAlive,
     loadCodeApiKey: db.loadCodeApiKey,
+    provisionCandidates: deferredProvisionFiles as unknown as TFile[],
   });
 
   /**

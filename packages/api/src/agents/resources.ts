@@ -291,6 +291,26 @@ const categorizeFileForToolResources = ({
 const codeEnvRouteKey = (ref: CodeEnvRef): string =>
   ref.executionRouteKey ?? ref.executionProfile ?? 'default';
 
+/** Attachments plus any deferred candidates not already present, deduped by file_id.
+ *  Only the provisioning computation sees this: the delivery list stays untouched. */
+const withDeferredCandidates = (
+  attachments: Array<TFile>,
+  candidates?: Array<TFile>,
+): Array<TFile> => {
+  if (!candidates || candidates.length === 0) {
+    return attachments;
+  }
+  const seen = new Set(attachments.map((file) => file.file_id));
+  const merged = [...attachments];
+  for (const candidate of candidates) {
+    if (candidate?.file_id && !seen.has(candidate.file_id)) {
+      seen.add(candidate.file_id);
+      merged.push(candidate);
+    }
+  }
+  return merged;
+};
+
 /**
  * Lazy provisioning: instead of provisioning files now, compute which files need
  * provisioning. Actual provisioning happens at tool invocation time via the
@@ -326,11 +346,25 @@ const computeProvisionState = async ({
     return undefined;
   }
 
+  /** Batch staleness check: identify which code env files are still alive. Only files
+   *  that already carry a default-route ref can be probed, so that set is computed
+   *  first: a turn whose attachments are all freshly uploaded has nothing to probe and
+   *  must not pay for a credential lookup that cannot change the outcome. */
+  const filesWithIdentifiers =
+    needsCodeEnv && checkSessionsAlive
+      ? attachments.filter(
+          (f) =>
+            f?.metadata?.codeEnvRef &&
+            codeEnvRouteKey(f.metadata.codeEnvRef) === 'default' &&
+            f.file_id,
+        )
+      : [];
+
   /** Code API auth is optional: deployments may use a legacy key, JWT bearer minting,
    *  or no auth at all, and the upload path handles each. Credentials therefore gate
    *  only the liveness probe, never whether files are queued for provisioning. */
   let codeApiKey: string | undefined;
-  if (needsCodeEnv && loadCodeApiKey && resourcePrincipal?.id) {
+  if (filesWithIdentifiers.length > 0 && loadCodeApiKey && resourcePrincipal?.id) {
     try {
       codeApiKey = await loadCodeApiKey(resourcePrincipal.id);
     } catch (error) {
@@ -338,25 +372,16 @@ const computeProvisionState = async ({
     }
   }
 
-  /** Batch staleness check: identify which code env files are still alive.
-   *  Requires credentials the callback can actually send: a legacy key, or a
-   *  req to mint JWT bearer auth from. Without either, skip the check so an
-   *  unauthorized 401 cannot mark live sandbox files as expired. */
+  /** Requires credentials the callback can actually send: a legacy key, or a req to
+   *  mint JWT bearer auth from. Without either, skip the check so an unauthorized 401
+   *  cannot mark live sandbox files as expired. */
   let aliveFileIds: Set<string> | undefined;
-  if (needsCodeEnv && checkSessionsAlive && (codeApiKey != null || req)) {
-    const filesWithIdentifiers = attachments.filter(
-      (f) =>
-        f?.metadata?.codeEnvRef &&
-        codeEnvRouteKey(f.metadata.codeEnvRef) === 'default' &&
-        f.file_id,
-    );
-    if (filesWithIdentifiers.length > 0) {
-      aliveFileIds = await checkSessionsAlive({
-        files: filesWithIdentifiers as TFile[],
-        req,
-        apiKey: codeApiKey,
-      });
-    }
+  if (filesWithIdentifiers.length > 0 && checkSessionsAlive && (codeApiKey != null || req)) {
+    aliveFileIds = await checkSessionsAlive({
+      files: filesWithIdentifiers as TFile[],
+      req,
+      apiKey: codeApiKey,
+    });
   }
 
   const codeEnvFiles: TFile[] = [];
@@ -443,6 +468,7 @@ export const primeResources = async ({
   enabledToolResources,
   checkSessionsAlive,
   loadCodeApiKey,
+  provisionCandidates,
 }: {
   req?: ServerRequest;
   principal?: Pick<IUser, 'id' | 'role'>;
@@ -459,6 +485,10 @@ export const primeResources = async ({
   checkSessionsAlive?: TCheckSessionsAlive;
   /** Optional callback to load CODE_API_KEY once per request */
   loadCodeApiKey?: TLoadCodeApiKey;
+  /** Attachments from earlier turns that were never provisioned. Considered for
+   *  provisioning only and never returned as attachments: re-delivering an earlier
+   *  upload to the model on every later turn is not the intent. */
+  provisionCandidates?: Array<TFile>;
 }): Promise<{
   attachments: Array<TFile | undefined> | undefined;
   requestAttachments: Array<TFile | undefined> | undefined;
@@ -606,7 +636,7 @@ export const primeResources = async ({
        *  provisioning here too, so a turn with no new attachment still primes them. */
       const contextProvisionState = await computeProvisionState({
         req,
-        attachments,
+        attachments: withDeferredCandidates(attachments, provisionCandidates),
         resourcePrincipal,
         enabledToolResources,
         tool_resources,
@@ -660,7 +690,7 @@ export const primeResources = async ({
 
     const provisionState = await computeProvisionState({
       req,
-      attachments,
+      attachments: withDeferredCandidates(attachments, provisionCandidates),
       resourcePrincipal,
       enabledToolResources,
       tool_resources,
