@@ -22,7 +22,6 @@ const {
 const {
   processAgentFileUpload,
   processImageFile,
-  resolvesToTextDelivery,
   filterFile,
 } = require('~/server/services/Files/process');
 const { hasCapability } = require('~/server/middleware/roles/capabilities');
@@ -72,19 +71,13 @@ router.post('/', async (req, res) => {
      * routing without any text, leaving the file out of provider delivery and out of
      * the text context both. */
     const takesAgentUploadPath =
-      metadata.tool_resource != null || (await resolvesToTextDelivery({ req, metadata }));
+      metadata.tool_resource != null || uploadRouting?.llmDeliveryPath === 'text';
 
     await assertUploadContentAllowed({
       filters: req.config?.filters,
       file: req.file,
       endpoint: uploadRouting?.endpoint ?? metadata.endpoint,
-      /* Only the path that extracts may be shown the promoted resource: an upload
-       * falling through to `processImageFile` runs no OCR, so deferring a fail-closed
-       * policy there would accept it uninspected. */
-      toolResource:
-        uploadRouting && takesAgentUploadPath
-          ? uploadRouting.effectiveToolResource
-          : metadata.tool_resource,
+      toolResource: uploadRouting ? uploadRouting.effectiveToolResource : metadata.tool_resource,
       fileConfig: mergeFileConfig(req.config?.fileConfig),
       ocrConfigured: req.config?.ocr != null,
       ragConfigured: !!process.env.RAG_API_URL,

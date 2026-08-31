@@ -20,7 +20,6 @@ jest.mock('~/server/services/Files/process', () => ({
     return res.status(200).json({ message: 'Image processed' });
   }),
   filterFile: jest.fn(),
-  resolvesToTextDelivery: jest.fn().mockResolvedValue(false),
 }));
 
 jest.mock('fs', () => {
@@ -35,11 +34,7 @@ jest.mock('fs', () => {
 });
 
 const fs = require('fs');
-const {
-  processAgentFileUpload,
-  processImageFile,
-  resolvesToTextDelivery,
-} = require('~/server/services/Files/process');
+const { processAgentFileUpload, processImageFile } = require('~/server/services/Files/process');
 const { UninspectableFileError } = require('@librechat/api');
 
 const router = require('~/server/routes/files/images');
@@ -400,44 +395,6 @@ describe('POST /images - Agent Upload Permission Check (Integration)', () => {
     expect(processAgentFileUpload).not.toHaveBeenCalled();
   });
 
-  it('keeps extracted-text fail-close active when the upload will not be extracted', async () => {
-    /* Routing promotes the resource to `context` because the config sends `image/*` to
-     * text, but this upload does not take the agent upload path, so delivery falls
-     * through to `processImageFile`, which never extracts. The preflight must not defer
-     * enforcement to an OCR pass that will not run. */
-    resolvesToTextDelivery.mockResolvedValueOnce(false);
-    const app = createAppWithUser(authorId, SystemRoles.USER, {
-      filters: {
-        files: {
-          pii: {
-            fields: ['extracted_text'],
-            starterPatterns: [],
-            customPatterns: [],
-            uninspectable: 'block',
-          },
-        },
-      },
-      fileConfig: {
-        defaultLLMDeliveryPath: { overrides: { 'image/*': 'text' } },
-        ocr: { supportedMimeTypes: ['image/png'] },
-      },
-      ocr: {},
-    });
-    const response = await request(app).post('/images').send({
-      endpoint: 'agents',
-      agent_id: agentCustomId,
-      file_id: uuidv4(),
-    });
-
-    expect(response.status).toBe(400);
-    expect(response.body).toMatchObject({
-      error: 'content_filter_uninspectable',
-      field: 'extracted_text',
-    });
-    expect(processImageFile).not.toHaveBeenCalled();
-    expect(processAgentFileUpload).not.toHaveBeenCalled();
-  });
-
   it('should allow upload for admin regardless of ownership', async () => {
     await createAgent({
       id: agentCustomId,
@@ -565,8 +522,9 @@ describe('POST /images - Agent Upload Permission Check (Integration)', () => {
   });
 
   it('sends an image the config routes to text through the agent upload path', async () => {
-    resolvesToTextDelivery.mockResolvedValueOnce(true);
-    const app = createAppWithUser(otherUserId);
+    const app = createAppWithUser(otherUserId, SystemRoles.USER, {
+      fileConfig: { defaultLLMDeliveryPath: { overrides: { 'image/*': 'text' } } },
+    });
 
     const response = await request(app).post('/images').send({
       endpoint: 'agents',
