@@ -1,7 +1,7 @@
 const path = require('path');
 const fs = require('fs').promises;
 const express = require('express');
-const { logger } = require('@librechat/data-schemas');
+const { logger, SystemCapabilities } = require('@librechat/data-schemas');
 const {
   getSafeErrorMetadata,
   shouldUseUploadSse,
@@ -24,6 +24,7 @@ const {
   processImageFile,
   filterFile,
 } = require('~/server/services/Files/process');
+const { hasCapability } = require('~/server/middleware/roles/capabilities');
 const { checkPermission } = require('~/server/services/PermissionService');
 const db = require('~/models');
 
@@ -65,11 +66,20 @@ router.post('/', async (req, res) => {
 
     filterFile({ req, image: true, endpointConfig: uploadRouting?.endpointConfig });
 
+    /* Only the agent-upload path performs extraction, so only it may present the
+     * promoted resource here. Handing a promoted `context` to an upload that falls
+     * through to `processImageFile` would defer a fail-closed policy on the promise
+     * of an OCR pass that never runs. */
+    const routesToAgentUpload = isAgentUpload && metadata.tool_resource != null;
+
     await assertUploadContentAllowed({
       filters: req.config?.filters,
       file: req.file,
       endpoint: uploadRouting?.endpoint ?? metadata.endpoint,
-      toolResource: uploadRouting ? uploadRouting.effectiveToolResource : metadata.tool_resource,
+      toolResource:
+        uploadRouting && routesToAgentUpload
+          ? uploadRouting.effectiveToolResource
+          : metadata.tool_resource,
       fileConfig: mergeFileConfig(req.config?.fileConfig),
       ocrConfigured: req.config?.ocr != null,
       ragConfigured: !!process.env.RAG_API_URL,
@@ -84,16 +94,30 @@ router.post('/', async (req, res) => {
      * a permanent upload against that agent. The authorized record is reused for
      * routing so the provider is not read a second time. */
     if (isAgentUpload && metadata.agent_id != null) {
-      const { denied } = await verifyAgentUploadPermission({
-        req,
-        res,
-        metadata,
-        agent: uploadAgent ?? null,
-        getAgent: db.getAgent,
-        checkPermission,
-      });
-      if (denied) {
-        return;
+      /* Capability holders bypass agent ACLs on writes, as the sibling `/files` route
+       * already does; a failed check denies the bypass rather than granting it. */
+      let skipUploadAuth = false;
+      try {
+        skipUploadAuth = await hasCapability(req.user, SystemCapabilities.MANAGE_AGENTS);
+      } catch (err) {
+        logger.warn(
+          '[/files/images] capability check failed, denying bypass:',
+          getSafeErrorMetadata(err),
+        );
+      }
+
+      if (!skipUploadAuth) {
+        const { denied } = await verifyAgentUploadPermission({
+          req,
+          res,
+          metadata,
+          agent: uploadAgent ?? null,
+          getAgent: db.getAgent,
+          checkPermission,
+        });
+        if (denied) {
+          return;
+        }
       }
     }
 

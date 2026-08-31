@@ -2,7 +2,7 @@ const express = require('express');
 const request = require('supertest');
 const mongoose = require('mongoose');
 const { v4: uuidv4 } = require('uuid');
-const { createMethods, logger } = require('@librechat/data-schemas');
+const { createMethods, logger, SystemCapabilities } = require('@librechat/data-schemas');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 const {
   SystemRoles,
@@ -47,6 +47,7 @@ describe('POST /images - Agent Upload Permission Check (Integration)', () => {
   let User;
   let Agent;
   let AclEntry;
+  let SystemGrant;
   let methods;
   let modelsToCleanup = [];
 
@@ -64,6 +65,7 @@ describe('POST /images - Agent Upload Permission Check (Integration)', () => {
     User = models.User;
     Agent = models.Agent;
     AclEntry = models.AclEntry;
+    SystemGrant = models.SystemGrant;
 
     await methods.seedDefaultRoles();
   });
@@ -86,6 +88,7 @@ describe('POST /images - Agent Upload Permission Check (Integration)', () => {
     await Agent.deleteMany({});
     await User.deleteMany({});
     await AclEntry.deleteMany({});
+    await SystemGrant.deleteMany({});
 
     authorId = new mongoose.Types.ObjectId();
     otherUserId = new mongoose.Types.ObjectId();
@@ -392,6 +395,42 @@ describe('POST /images - Agent Upload Permission Check (Integration)', () => {
     expect(processAgentFileUpload).not.toHaveBeenCalled();
   });
 
+  it('keeps extracted-text fail-close active for an image auto-routed to text', async () => {
+    /* No tool resource is posted, so routing promotes the upload to `context`. Delivery
+     * still falls through to `processImageFile`, which never extracts, so the preflight
+     * must not defer enforcement to an OCR pass that will not run. */
+    const app = createAppWithUser(authorId, SystemRoles.USER, {
+      filters: {
+        files: {
+          pii: {
+            fields: ['extracted_text'],
+            starterPatterns: [],
+            customPatterns: [],
+            uninspectable: 'block',
+          },
+        },
+      },
+      fileConfig: {
+        defaultLLMDeliveryPath: { overrides: { 'image/*': 'text' } },
+        ocr: { supportedMimeTypes: ['image/png'] },
+      },
+      ocr: {},
+    });
+    const response = await request(app).post('/images').send({
+      endpoint: 'agents',
+      agent_id: agentCustomId,
+      file_id: uuidv4(),
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.body).toMatchObject({
+      error: 'content_filter_uninspectable',
+      field: 'extracted_text',
+    });
+    expect(processImageFile).not.toHaveBeenCalled();
+    expect(processAgentFileUpload).not.toHaveBeenCalled();
+  });
+
   it('should allow upload for admin regardless of ownership', async () => {
     await createAgent({
       id: agentCustomId,
@@ -402,6 +441,37 @@ describe('POST /images - Agent Upload Permission Check (Integration)', () => {
     });
 
     const app = createAppWithUser(otherUserId, SystemRoles.ADMIN);
+    const response = await request(app).post('/images').send({
+      endpoint: 'agents',
+      agent_id: agentCustomId,
+      tool_resource: 'context',
+      file_id: uuidv4(),
+    });
+
+    expect(response.status).toBe(200);
+    expect(processAgentFileUpload).toHaveBeenCalled();
+  });
+
+  it('allows an image upload for a non-admin role holding MANAGE_AGENTS', async () => {
+    await createAgent({
+      id: agentCustomId,
+      name: 'Test Agent',
+      provider: 'openai',
+      model: 'gpt-4',
+      author: authorId,
+    });
+
+    await SystemGrant.create({
+      principalType: PrincipalType.ROLE,
+      principalId: 'MANAGER',
+      capability: SystemCapabilities.MANAGE_AGENTS,
+      grantedAt: new Date(),
+    });
+
+    /* otherUserId holds no ACL on this agent: the capability alone must carry it, as it
+     * already does on the sibling `/files` route. */
+    const app = createAppWithUser(otherUserId, 'MANAGER');
+
     const response = await request(app).post('/images').send({
       endpoint: 'agents',
       agent_id: agentCustomId,
