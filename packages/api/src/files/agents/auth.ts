@@ -5,8 +5,15 @@ import type { Response } from 'express';
 import type { Types } from 'mongoose';
 import type { ServerRequest } from '~/types';
 
+/** The agent an upload targets, as far as authorization and routing need it. */
+export interface AuthorizedUploadAgent {
+  _id: string | Types.ObjectId;
+  author?: string | Types.ObjectId | null;
+  provider?: string;
+}
+
 export type AgentUploadAuthResult =
-  | { allowed: true }
+  | { allowed: true; agent?: AuthorizedUploadAgent }
   | { allowed: false; status: number; error: string; message: string };
 
 export interface AgentUploadAuthParams {
@@ -15,13 +22,13 @@ export interface AgentUploadAuthParams {
   agentId?: string;
   toolResource?: string | null;
   messageFile?: boolean | string;
+  /** Already-loaded agent, when the caller resolved it for routing. Avoids reading
+   *  the same record twice on an upload that has to route before it validates. */
+  agent?: AuthorizedUploadAgent | null;
 }
 
 export interface AgentUploadAuthDeps {
-  getAgent: (params: { id: string }) => Promise<{
-    _id: string | Types.ObjectId;
-    author?: string | Types.ObjectId | null;
-  } | null>;
+  getAgent: (params: { id: string }) => Promise<AuthorizedUploadAgent | null>;
   checkPermission: (params: {
     userId: string;
     role: string;
@@ -48,17 +55,20 @@ export async function checkAgentUploadAuth(
     return { allowed: true };
   }
 
+  /* The agent is returned alongside the verdict so callers can route the upload from
+   * its provider without a second read of the same record, and accepted as input for
+   * callers that had to resolve it before validation. */
+  const agent = params.agent !== undefined ? params.agent : await getAgent({ id: agentId });
   if (userRole === SystemRoles.ADMIN) {
-    return { allowed: true };
+    return { allowed: true, agent: agent ?? undefined };
   }
 
-  const agent = await getAgent({ id: agentId });
   if (!agent) {
     return { allowed: false, status: 404, error: 'Not Found', message: 'Agent not found' };
   }
 
   if (agent.author?.toString() === userId) {
-    return { allowed: true };
+    return { allowed: true, agent };
   }
 
   const hasEditPermission = await checkPermission({
@@ -70,7 +80,7 @@ export async function checkAgentUploadAuth(
   });
 
   if (hasEditPermission) {
-    return { allowed: true };
+    return { allowed: true, agent };
   }
 
   logger.warn(
@@ -84,20 +94,24 @@ export async function checkAgentUploadAuth(
   };
 }
 
-/** @returns true if denied (response already sent), false if allowed */
+/** Sends the error response when denied. Returns the authorized agent when it loaded
+ *  one, so the caller can route the upload without reading the record again. */
 export async function verifyAgentUploadPermission({
   req,
   res,
   metadata,
+  agent,
   getAgent,
   checkPermission,
 }: {
   req: ServerRequest;
   res: Response;
   metadata: { agent_id?: string; tool_resource?: string | null; message_file?: boolean | string };
+  /** Pre-resolved agent, when the caller already loaded it. */
+  agent?: AuthorizedUploadAgent | null;
   getAgent: AgentUploadAuthDeps['getAgent'];
   checkPermission: AgentUploadAuthDeps['checkPermission'];
-}): Promise<boolean> {
+}): Promise<{ denied: boolean; agent?: AuthorizedUploadAgent }> {
   const user = req.user as IUser;
   const result = await checkAgentUploadAuth(
     {
@@ -106,13 +120,14 @@ export async function verifyAgentUploadPermission({
       agentId: metadata.agent_id,
       toolResource: metadata.tool_resource,
       messageFile: metadata.message_file,
+      agent,
     },
     { getAgent, checkPermission },
   );
 
   if (!result.allowed) {
     res.status(result.status).json({ error: result.error, message: result.message });
-    return true;
+    return { denied: true };
   }
-  return false;
+  return { denied: false, agent: result.agent };
 }

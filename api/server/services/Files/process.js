@@ -17,7 +17,6 @@ const {
   removeNullishValues,
   isAssistantsEndpoint,
   getEndpointFileConfig,
-  resolveDefaultLLMDeliveryPath,
 } = require('librechat-data-provider');
 const { logger, runAsSystem } = require('@librechat/data-schemas');
 const {
@@ -37,6 +36,7 @@ const {
   contentFilterBlockResponse,
   sweepExpiredFiles: sweepExpiredFilesWithDeps,
   startExpiredFileSweep: startExpiredFileSweepWithDeps,
+  resolveUploadRouting,
 } = require('@librechat/api');
 const {
   convertImage,
@@ -449,30 +449,6 @@ const processFileURL = async ({
   }
 };
 
-/** Agent uploads carry endpoint=agents; resolve the file config from the agent's
- *  own provider so provider-specific defaultLLMDeliveryPath overrides are honored. */
-const resolveUploadEndpoint = async ({ endpoint, agent_id }) => {
-  if (!agent_id) {
-    return endpoint;
-  }
-  const uploadAgent = await db.getAgent({ id: agent_id });
-  return uploadAgent?.provider || endpoint;
-};
-
-const resolveDefaultUploadLLMDeliveryPath = ({ file, endpointConfig, fileConfig, endpoint }) => {
-  const isLegacyFileUploadUX = endpointConfig?.legacyFileUploadUX === true;
-  if (isLegacyFileUploadUX) {
-    return 'provider';
-  }
-
-  return resolveDefaultLLMDeliveryPath(
-    file.mimetype,
-    endpointConfig?.defaultLLMDeliveryPath,
-    fileConfig?.defaultLLMDeliveryPath,
-    endpoint,
-  );
-};
-
 /**
  * Applies the current strategy for image uploads.
  * Saves file metadata to the database with an expiry TTL.
@@ -485,20 +461,27 @@ const resolveDefaultUploadLLMDeliveryPath = ({ file, endpointConfig, fileConfig,
  * @param {import('@librechat/api').UploadSseStream | null} [params.sseStream] - Active upload SSE stream, if enabled.
  * @returns {Promise<void>}
  */
-const processImageFile = async ({ req, res, metadata, returnFile = false, sseStream }) => {
+const processImageFile = async ({
+  req,
+  res,
+  metadata,
+  returnFile = false,
+  sseStream,
+  uploadAgent,
+}) => {
   const { file } = req;
   const appConfig = req.config;
   const source = getFileStrategy(appConfig, { isImage: true });
   const { handleImageUpload } = getStrategyFunctions(source);
   const { file_id, temp_file_id, endpoint, agent_id } = metadata;
   const fileConfig = mergeFileConfig(appConfig?.fileConfig);
-  const configEndpoint = await resolveUploadEndpoint({ endpoint, agent_id });
-  const endpointConfig = getEndpointFileConfig({ fileConfig, endpoint: configEndpoint });
-  const llmDeliveryPath = resolveDefaultUploadLLMDeliveryPath({
+  const { llmDeliveryPath } = resolveUploadRouting({
     file,
-    endpointConfig,
+    requestEndpoint: endpoint,
+    agentProvider: uploadAgent?.provider,
+    agentId: agent_id,
+    messageAttachment: metadata.message_file === true || metadata.message_file === 'true',
     fileConfig,
-    endpoint: configEndpoint,
   });
 
   const { filepath, bytes, width, height, storageKey, storageRegion } = await handleImageUpload({
@@ -699,27 +682,6 @@ const processFileUpload = async ({ req, res, metadata, sseStream }) => {
   sendUploadSuccess(res, sseStream, 'File uploaded and processed successfully', result);
 };
 
-const resolveUploadLLMDeliveryPath = ({
-  tool_resource,
-  file,
-  endpointConfig,
-  fileConfig,
-  endpoint,
-}) => {
-  if (tool_resource === EToolResources.context || tool_resource === EToolResources.ocr) {
-    return 'text';
-  }
-
-  if (
-    tool_resource === EToolResources.file_search ||
-    tool_resource === EToolResources.execute_code
-  ) {
-    return 'none';
-  }
-
-  return resolveDefaultUploadLLMDeliveryPath({ file, endpointConfig, fileConfig, endpoint });
-};
-
 /**
  * Applies the current strategy for file uploads.
  * Saves file metadata to the database with an expiry TTL.
@@ -732,7 +694,7 @@ const resolveUploadLLMDeliveryPath = ({
  * @param {import('@librechat/api').UploadSseStream | null} [params.sseStream] - Active upload SSE stream, if enabled.
  * @returns {Promise<void>}
  */
-const processAgentFileUpload = async ({ req, res, metadata, sseStream }) => {
+const processAgentFileUpload = async ({ req, res, metadata, sseStream, uploadAgent }) => {
   // TODO: check and potentially fix — deferred/provider files may be orphaned if effectiveToolResource is undefined
   const { file } = req;
   const appConfig = req.config;
@@ -740,29 +702,21 @@ const processAgentFileUpload = async ({ req, res, metadata, sseStream }) => {
 
   let messageAttachment = !!metadata.message_file;
 
-  let effectiveToolResource =
-    tool_resource === EToolResources.ocr ? EToolResources.context : tool_resource;
-
   const fileConfig = mergeFileConfig(appConfig?.fileConfig);
-  const endpoint = await resolveUploadEndpoint({ endpoint: req.body?.endpoint, agent_id });
-  const endpointConfig = getEndpointFileConfig({ fileConfig, endpoint });
-
-  if (agent_id && !tool_resource && !messageAttachment) {
-    if (endpointConfig?.legacyFileUploadUX === true) {
-      throw new Error('No tool resource provided for agent file upload');
-    }
-  }
-
-  const llmDeliveryPath = resolveUploadLLMDeliveryPath({
-    tool_resource,
+  const routing = resolveUploadRouting({
     file,
-    endpointConfig,
+    requestEndpoint: req.body?.endpoint,
+    agentProvider: uploadAgent?.provider,
+    agentId: agent_id,
+    toolResource: tool_resource,
+    messageAttachment,
     fileConfig,
-    endpoint,
   });
+  const { endpoint, endpointConfig, llmDeliveryPath } = routing;
+  let effectiveToolResource = routing.effectiveToolResource;
 
-  if (!tool_resource && llmDeliveryPath === 'text') {
-    effectiveToolResource = EToolResources.context;
+  if (routing.requiresExplicitToolResource) {
+    throw new Error('No tool resource provided for agent file upload');
   }
 
   if (effectiveToolResource === EToolResources.file_search && file.mimetype.startsWith('image')) {
@@ -1455,7 +1409,13 @@ async function saveBase64Image(
  *
  * @throws {Error} If a file exception is caught (invalid file size or type, lack of metadata).
  */
-function filterFile({ req, image, isAvatar }) {
+/**
+ * @param {object} params
+ * @param {object} [params.endpointConfig] - Effective config resolved from the agent's
+ *   provider. Without it the posted endpoint governs, which for an agent upload is the
+ *   generic `agents` entry rather than the provider actually receiving the file.
+ */
+function filterFile({ req, image, isAvatar, endpointConfig }) {
   const { file } = req;
   const { endpoint, endpointType, file_id, width, height } = req.body;
 
@@ -1479,11 +1439,13 @@ function filterFile({ req, image, isAvatar }) {
   const appConfig = req.config;
   const fileConfig = mergeFileConfig(appConfig.fileConfig);
 
-  const endpointFileConfig = getEndpointFileConfig({
-    endpoint,
-    fileConfig,
-    endpointType,
-  });
+  const endpointFileConfig =
+    endpointConfig ??
+    getEndpointFileConfig({
+      endpoint,
+      fileConfig,
+      endpointType,
+    });
   const fileSizeLimit =
     isAvatar === true ? fileConfig.avatarSizeLimit : endpointFileConfig.fileSizeLimit;
 

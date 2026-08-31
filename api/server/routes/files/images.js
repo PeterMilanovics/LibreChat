@@ -12,6 +12,7 @@ const {
   assertUploadContentAllowed,
   hasActiveFilePolicy,
   sanitizeFilename,
+  resolveUploadRouting,
 } = require('@librechat/api');
 const {
   isAssistantsEndpoint,
@@ -43,13 +44,32 @@ router.post('/', async (req, res) => {
 
   try {
     req.file.originalname = sanitizeFilename(req.file.originalname);
-    filterFile({ req, image: true });
+
+    /* Same ordering as the file route: resolve the agent once so the provider's limits
+     * govern validation and the preflight sees the effective resource, then hand the
+     * record to authorization rather than reading it again. */
+    const isAgentUpload = !isAssistantsEndpoint(metadata.endpoint);
+    const uploadAgent =
+      isAgentUpload && metadata.agent_id ? await db.getAgent({ id: metadata.agent_id }) : undefined;
+    const uploadRouting = isAgentUpload
+      ? resolveUploadRouting({
+          file: req.file,
+          requestEndpoint: metadata.endpoint,
+          agentProvider: uploadAgent?.provider,
+          agentId: metadata.agent_id,
+          toolResource: metadata.tool_resource,
+          messageAttachment: metadata.message_file === true || metadata.message_file === 'true',
+          fileConfig: mergeFileConfig(req.config?.fileConfig),
+        })
+      : undefined;
+
+    filterFile({ req, image: true, endpointConfig: uploadRouting?.endpointConfig });
 
     await assertUploadContentAllowed({
       filters: req.config?.filters,
       file: req.file,
-      endpoint: metadata.endpoint,
-      toolResource: metadata.tool_resource,
+      endpoint: uploadRouting?.endpoint ?? metadata.endpoint,
+      toolResource: uploadRouting ? uploadRouting.effectiveToolResource : metadata.tool_resource,
       fileConfig: mergeFileConfig(req.config?.fileConfig),
       ocrConfigured: req.config?.ocr != null,
       ragConfigured: !!process.env.RAG_API_URL,
@@ -59,23 +79,31 @@ router.post('/', async (req, res) => {
     metadata.temp_file_id = metadata.file_id;
     metadata.file_id = req.file_id;
 
-    if (!isAssistantsEndpoint(metadata.endpoint) && metadata.tool_resource != null) {
-      const denied = await verifyAgentUploadPermission({
+    /* Authorize whenever the upload names an agent, not only when it names a tool
+     * resource: message attachments are exempt inside the check, so what remains is
+     * a permanent upload against that agent. The authorized record is reused for
+     * routing so the provider is not read a second time. */
+    if (isAgentUpload && metadata.agent_id != null) {
+      const { denied } = await verifyAgentUploadPermission({
         req,
         res,
         metadata,
+        agent: uploadAgent ?? null,
         getAgent: db.getAgent,
         checkPermission,
       });
       if (denied) {
         return;
       }
+    }
+
+    if (isAgentUpload && metadata.tool_resource != null) {
       openSseStreamIfRequested();
-      return await processAgentFileUpload({ req, res, metadata, sseStream });
+      return await processAgentFileUpload({ req, res, metadata, sseStream, uploadAgent });
     }
 
     openSseStreamIfRequested();
-    await processImageFile({ req, res, metadata, sseStream });
+    await processImageFile({ req, res, metadata, sseStream, uploadAgent });
   } catch (error) {
     // TODO: delete remote file if it exists
     logger.error('[/files/images] Error processing file:', getSafeErrorMetadata(error));

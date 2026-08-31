@@ -18,6 +18,7 @@ const {
   assertUploadContentAllowed,
   hasActiveFilePolicy,
   sanitizeFilename,
+  resolveUploadRouting,
 } = require('@librechat/api');
 const {
   Time,
@@ -731,13 +732,32 @@ router.post('/', async (req, res) => {
 
   try {
     req.file.originalname = sanitizeFilename(req.file.originalname);
-    filterFile({ req });
+
+    /* Resolved before validation so the provider's own limits and MIME allowlist
+     * apply, and so the preflight sees the resource this upload will behave as. The
+     * record is read once here and handed to the authorization step below. */
+    const isAgentUpload = !isAssistantsEndpoint(metadata.endpoint);
+    const uploadAgent =
+      isAgentUpload && metadata.agent_id ? await db.getAgent({ id: metadata.agent_id }) : undefined;
+    const uploadRouting = isAgentUpload
+      ? resolveUploadRouting({
+          file: req.file,
+          requestEndpoint: metadata.endpoint,
+          agentProvider: uploadAgent?.provider,
+          agentId: metadata.agent_id,
+          toolResource: metadata.tool_resource,
+          messageAttachment: metadata.message_file === true || metadata.message_file === 'true',
+          fileConfig: mergeFileConfig(req.config?.fileConfig),
+        })
+      : undefined;
+
+    filterFile({ req, endpointConfig: uploadRouting?.endpointConfig });
 
     await assertUploadContentAllowed({
       filters: req.config?.filters,
       file: req.file,
-      endpoint: metadata.endpoint,
-      toolResource: metadata.tool_resource,
+      endpoint: uploadRouting?.endpoint ?? metadata.endpoint,
+      toolResource: uploadRouting ? uploadRouting.effectiveToolResource : metadata.tool_resource,
       fileConfig: mergeFileConfig(req.config?.fileConfig),
       ocrConfigured: req.config?.ocr != null,
       ragConfigured: !!process.env.RAG_API_URL,
@@ -747,7 +767,7 @@ router.post('/', async (req, res) => {
     metadata.temp_file_id = metadata.file_id;
     metadata.file_id = req.file_id;
 
-    if (isAssistantsEndpoint(metadata.endpoint)) {
+    if (!isAgentUpload) {
       openSseStreamIfRequested();
       return await processFileUpload({ req, res, metadata, sseStream });
     }
@@ -759,11 +779,15 @@ router.post('/', async (req, res) => {
       logger.warn('[/files] capability check failed, denying bypass:', getSafeErrorMetadata(err));
     }
 
+    /* The authorization step already reads the agent, so its provider is reused for
+     * routing rather than read again. An admin bypass skips authorization, so that
+     * path loads the record once here instead. */
     if (!skipUploadAuth) {
-      const denied = await verifyAgentUploadPermission({
+      const { denied } = await verifyAgentUploadPermission({
         req,
         res,
         metadata,
+        agent: uploadAgent ?? null,
         getAgent: db.getAgent,
         checkPermission,
       });
@@ -773,7 +797,7 @@ router.post('/', async (req, res) => {
     }
 
     openSseStreamIfRequested();
-    return await processAgentFileUpload({ req, res, metadata, sseStream });
+    return await processAgentFileUpload({ req, res, metadata, sseStream, uploadAgent });
   } catch (error) {
     if (
       sendUploadPolicyError(res, sseStream, error, {
