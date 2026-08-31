@@ -4,6 +4,7 @@ export * from './code';
 export * from './context';
 export * from './deletion';
 export * from './extract';
+export * from './upload/routing';
 export * from './documents/crud';
 export * from './encode';
 export * from './filter';
