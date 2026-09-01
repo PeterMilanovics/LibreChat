@@ -29,8 +29,8 @@ const {
   resolveUploadEndpoint,
   resolveUploadAgent,
 } = require('~/server/services/Files/routing');
-const { hasCapability } = require('~/server/middleware/roles/capabilities');
 const { checkPermission } = require('~/server/services/PermissionService');
+const { hasCapability } = require('~/server/middleware/roles/capabilities');
 
 const router = express.Router();
 

@@ -1,5 +1,5 @@
 import { SystemRoles, PermissionBits } from 'librechat-data-provider';
-import { checkAgentUploadAuth } from './auth';
+import { checkAgentUploadAuth, verifyAgentUploadPermission } from './auth';
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: { warn: jest.fn(), error: jest.fn() },
@@ -37,30 +37,6 @@ describe('checkAgentUploadAuth', () => {
     expect(result.allowed).toBe(true);
   });
 
-  it('lets a capability holder bypass the ACL', async () => {
-    const result = await checkAgentUploadAuth(
-      { userId: 'manager-id', userRole: SystemRoles.USER, agentId: 'victim-agent' },
-      { getAgent, checkPermission, hasUploadBypass: jest.fn().mockResolvedValue(true) },
-    );
-
-    expect(result.allowed).toBe(true);
-    expect(checkPermission).not.toHaveBeenCalled();
-  });
-
-  it('reports a missing agent even to a caller holding the bypass', async () => {
-    /* The bypass waives the ACL decision, not the agent's existence: letting a stale id
-     * through would surface as a late failure once processing has already written the
-     * file to remote storage. */
-    getAgent.mockResolvedValue(null);
-
-    const result = await checkAgentUploadAuth(
-      { userId: 'manager-id', userRole: SystemRoles.USER, agentId: 'missing-agent' },
-      { getAgent, checkPermission, hasUploadBypass: jest.fn().mockResolvedValue(true) },
-    );
-
-    expect(result).toMatchObject({ allowed: false, status: 404 });
-  });
-
   it('reports a missing agent to an admin rather than proceeding', async () => {
     getAgent.mockResolvedValue(null);
 
@@ -70,20 +46,6 @@ describe('checkAgentUploadAuth', () => {
     );
 
     expect(result).toMatchObject({ allowed: false, status: 404 });
-  });
-
-  it('denies the bypass when the capability check throws', async () => {
-    const result = await checkAgentUploadAuth(
-      { userId: 'manager-id', userRole: SystemRoles.USER, agentId: 'victim-agent' },
-      {
-        getAgent,
-        checkPermission,
-        hasUploadBypass: jest.fn().mockRejectedValue(new Error('capability lookup failed')),
-      },
-    );
-
-    expect(result.allowed).toBe(false);
-    expect(checkPermission).toHaveBeenCalled();
   });
 
   it('allows the agent author without consulting permissions', async () => {
@@ -155,5 +117,89 @@ describe('checkAgentUploadAuth', () => {
     );
 
     expect(result.allowed).toBe(false);
+  });
+});
+
+describe('verifyAgentUploadPermission', () => {
+  const agent = { _id: 'agent-object-id', author: { toString: () => 'owner-id' } };
+  const getAgent = jest.fn();
+  const checkPermission = jest.fn();
+  const makeRes = () => {
+    const status = jest.fn();
+    const res = { status, json: jest.fn() };
+    status.mockReturnValue(res);
+    return res as unknown as Parameters<typeof verifyAgentUploadPermission>[0]['res'];
+  };
+  const req = { user: { id: 'manager-id', role: SystemRoles.USER } } as unknown as Parameters<
+    typeof verifyAgentUploadPermission
+  >[0]['req'];
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    getAgent.mockResolvedValue(agent);
+    checkPermission.mockResolvedValue(false);
+  });
+
+  it('allows an upload the global capability permits', async () => {
+    /* The bypass lives here rather than at each route, because the two upload routes
+     * answered it differently and an image upload was refused where a file one passed. */
+    const denied = await verifyAgentUploadPermission({
+      req,
+      res: makeRes(),
+      metadata: { agent_id: 'victim-agent' },
+      getAgent,
+      checkPermission,
+      hasUploadBypass: async () => true,
+    });
+
+    expect(denied).toBe(false);
+  });
+
+  it('reports a missing agent rather than letting the capability waive it', async () => {
+    /* The capability waives the per-agent grant, not the agent's existence. Letting a
+     * stale id through here surfaces as a late failure once processing has already
+     * written the file to remote storage, on a route with no cleanup. */
+    getAgent.mockResolvedValue(null);
+    const res = makeRes();
+
+    const denied = await verifyAgentUploadPermission({
+      req,
+      res,
+      metadata: { agent_id: 'missing-agent' },
+      getAgent,
+      checkPermission,
+      hasUploadBypass: async () => true,
+    });
+
+    expect(denied).toBe(true);
+    expect(res.status).toHaveBeenCalledWith(404);
+  });
+
+  it('denies the same upload when the capability is absent', async () => {
+    const denied = await verifyAgentUploadPermission({
+      req,
+      res: makeRes(),
+      metadata: { agent_id: 'victim-agent' },
+      getAgent,
+      checkPermission,
+      hasUploadBypass: async () => false,
+    });
+
+    expect(denied).toBe(true);
+  });
+
+  it('denies rather than allowing when the capability lookup throws', async () => {
+    const denied = await verifyAgentUploadPermission({
+      req,
+      res: makeRes(),
+      metadata: { agent_id: 'victim-agent' },
+      getAgent,
+      checkPermission,
+      hasUploadBypass: async () => {
+        throw new Error('capability service unavailable');
+      },
+    });
+
+    expect(denied).toBe(true);
   });
 });
