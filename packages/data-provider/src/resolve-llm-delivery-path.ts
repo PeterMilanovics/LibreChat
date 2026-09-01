@@ -44,7 +44,7 @@ const TEXT_RECOVERABLE_MIME_TYPES: RegExp[] = [
   /^text\//,
   /^image\//,
   /^audio\//,
-  /^application\/(json|xml|sql|yaml|csv|typescript|x-sh|vnd\.coffeescript)$/,
+  /^application\/(json|javascript|xml|sql|yaml|x-yaml|csv|typescript|x-sh|vnd\.coffeescript)$/,
   /^application\/pdf$/,
   /* Only the formats the built-in document parser handles. Presentations and graphics
    * are absent from documentParserMimeTypes, so on a deployment without OCR they would
@@ -59,11 +59,27 @@ const TEXT_RECOVERABLE_MIME_TYPES: RegExp[] = [
  * Types whose bytes are text already, so reading them directly is meaningful. Everything
  * else needs a real extractor: decoding it as UTF-8 produces mojibake rather than content.
  */
+/** Application types whose payload is text. Mirrors the set the content-protection code
+ *  treats as textual, plus the source and data formats this pipeline also accepts. */
+const TEXTUAL_APPLICATION_MIME_TYPES = new Set([
+  'application/json',
+  'application/javascript',
+  'application/sql',
+  'application/xml',
+  'application/x-yaml',
+  'application/yaml',
+  'application/csv',
+  'application/typescript',
+  'application/x-sh',
+  'application/vnd.coffeescript',
+]);
+
 export function isNativelyReadableText(mimeType: string): boolean {
+  const normalized = mimeType.split(';', 1)[0].trim().toLowerCase();
   return (
-    /^text\//.test(mimeType) ||
-    /^application\/(json|xml|sql|yaml|csv|typescript|x-sh|vnd\.coffeescript)$/.test(mimeType) ||
-    mimeType === 'message/rfc822'
+    normalized.startsWith('text/') ||
+    TEXTUAL_APPLICATION_MIME_TYPES.has(normalized) ||
+    normalized === 'message/rfc822'
   );
 }
 
@@ -205,8 +221,20 @@ export function resolveUploadLLMDeliveryPath({
   return resolveDefaultUploadLLMDeliveryPath({ mimeType, endpointConfig, fileConfig, endpoint });
 }
 
+/**
+ * Whether a file tool can do anything with this type. `file_search` indexes extracted
+ * text, so an image gives it nothing to embed. Shared with the upload guard so selection
+ * and rejection cannot disagree about the same pairing.
+ */
+export function canToolResourceConsume(toolResource: string, mimeType: string): boolean {
+  if (toolResource === EToolResources.file_search) {
+    return !mimeType.startsWith('image');
+  }
+  return true;
+}
+
 /** Why an upload cannot be accepted, when nothing would be able to read it. */
-export type UploadRejection = 'no-consumer' | 'no-agent-resource';
+export type UploadRejection = 'no-agent-resource';
 
 /**
  * Where a unified upload will end up, and whether it can be accepted at all.
@@ -241,17 +269,15 @@ export function resolveUploadDestination(params: {
     return { toolResource: EToolResources.context };
   }
 
+  /* Skills contribute file tools per turn without being stored on the agent, so this list
+   * can name a consumer but its silence proves nothing. Used to file an upload, never to
+   * refuse one, and matched on what each tool can actually read so the choice does not
+   * depend on the order the agent happens to list its tools in. */
   const consumingTool = agentTools?.find(
-    (tool) => tool === EToolResources.execute_code || tool === EToolResources.file_search,
+    (tool) =>
+      (tool === EToolResources.execute_code || tool === EToolResources.file_search) &&
+      canToolResourceConsume(tool, mimeType),
   );
-
-  if (deliveryPath === 'none' && !hasTextExtractionPath(mimeType)) {
-    /* An administrator who routes a readable type to none has chosen tool-only access
-     * deliberately and is warned about it at boot, so only unreadable types are refused. */
-    if (agentTools != null && consumingTool == null) {
-      return { rejection: 'no-consumer' };
-    }
-  }
 
   if (!isMessageAttachment && deliveryPath === 'none' && consumingTool) {
     return { toolResource: consumingTool };

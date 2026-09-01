@@ -1,5 +1,7 @@
 import type { TDefaultLLMDeliveryPathConfig } from './file-config';
 import {
+  isNativelyReadableText,
+  canToolResourceConsume,
   resolveUploadDestination,
   resolveDefaultLLMDeliveryPath,
   SYSTEM_LLM_DELIVERY_DEFAULTS,
@@ -304,10 +306,17 @@ describe('resolveUploadDestination', () => {
     );
   });
 
-  it('refuses a type no enabled tool can read', () => {
+  it('does not refuse an upload for having no consumer on the agent record', () => {
+    /* A skill can contribute file search or code execution for the turn without appearing
+     * in agent.tools, so an empty list is not evidence that nothing will read the file. */
     expect(
-      resolveUploadDestination({ ...base, deliveryPath: 'none', agentTools: [] }).rejection,
-    ).toBe('no-consumer');
+      resolveUploadDestination({
+        ...base,
+        deliveryPath: 'none',
+        agentTools: [],
+        isMessageAttachment: true,
+      }).rejection,
+    ).toBeUndefined();
   });
 
   it('does not judge an unknown tool set', () => {
@@ -321,6 +330,24 @@ describe('resolveUploadDestination', () => {
     ).toBeUndefined();
   });
 
+  it('picks a consumer that can read the type, whatever order the tools are listed in', () => {
+    /* file_search indexes extracted text and has nothing to do with an image, so choosing
+     * it would make the upload fail on a rule the agent's tool order decided. */
+    for (const agentTools of [
+      ['file_search', 'execute_code'],
+      ['execute_code', 'file_search'],
+    ]) {
+      expect(
+        resolveUploadDestination({
+          ...base,
+          mimeType: 'image/png',
+          deliveryPath: 'none',
+          agentTools,
+        }).toolResource,
+      ).toBe('execute_code');
+    }
+  });
+
   it('files a permanent upload under the tool that will consume it', () => {
     expect(
       resolveUploadDestination({ ...base, deliveryPath: 'none', agentTools: ['execute_code'] })
@@ -332,7 +359,6 @@ describe('resolveUploadDestination', () => {
     expect(
       resolveUploadDestination({
         ...base,
-        mimeType: 'image/png',
         deliveryPath: 'provider',
         agentTools: [],
       }).rejection,
@@ -343,10 +369,66 @@ describe('resolveUploadDestination', () => {
     expect(
       resolveUploadDestination({
         ...base,
-        mimeType: 'image/png',
         deliveryPath: 'provider',
         isMessageAttachment: true,
       }),
     ).toEqual({});
+  });
+});
+
+describe('isNativelyReadableText', () => {
+  it('admits the application types whose payload is text', () => {
+    /* Kept in step with the textual set in the content-protection code. Missing one sends
+     * a readable file down the extractor path, where no parser claims it and it is lost. */
+    for (const mimeType of [
+      'application/json',
+      'application/javascript',
+      'application/sql',
+      'application/xml',
+      'application/x-yaml',
+      'application/yaml',
+      'text/markdown',
+      'message/rfc822',
+    ]) {
+      expect(isNativelyReadableText(mimeType)).toBe(true);
+    }
+  });
+
+  it('rejects types whose bytes are not text', () => {
+    for (const mimeType of ['application/zip', 'application/pdf', 'image/png']) {
+      expect(isNativelyReadableText(mimeType)).toBe(false);
+    }
+  });
+
+  it('ignores parameters and case, as browsers send both', () => {
+    expect(isNativelyReadableText('text/plain; charset=utf-8')).toBe(true);
+    expect(isNativelyReadableText('Application/JSON')).toBe(true);
+  });
+});
+
+describe('canToolResourceConsume', () => {
+  it('keeps images away from file search and lets code execution take anything', () => {
+    expect(canToolResourceConsume('file_search', 'image/png')).toBe(false);
+    expect(canToolResourceConsume('file_search', 'application/pdf')).toBe(true);
+    expect(canToolResourceConsume('execute_code', 'image/png')).toBe(true);
+  });
+});
+
+describe('provider document capability', () => {
+  it('keeps Bedrock documents on the provider path', () => {
+    /* Bedrock is in documentSupportedProviders, so the capability downgrade does not
+     * apply to it. Pinned because the Converse document path handles more than PDF and a
+     * downgrade here would silently flatten it through extraction. */
+    expect(resolveDefaultLLMDeliveryPath('application/pdf', undefined, undefined, 'bedrock')).toBe(
+      'provider',
+    );
+    expect(
+      resolveDefaultLLMDeliveryPath(
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        undefined,
+        undefined,
+        'bedrock',
+      ),
+    ).toBe('provider');
   });
 });

@@ -20,6 +20,7 @@ const {
   resolveUploadLLMDeliveryPath,
   isNativelyReadableText,
   resolveUploadDestination,
+  canToolResourceConsume,
 } = require('librechat-data-provider');
 const { logger, runAsSystem } = require('@librechat/data-schemas');
 const {
@@ -730,11 +731,6 @@ const processAgentFileUpload = async ({ req, res, metadata, sseStream }) => {
     isMessageAttachment: messageAttachment,
   });
 
-  if (destination.rejection === 'no-consumer') {
-    throw new Error(
-      `Files of type ${file.mimetype} are not sent to the model and can only be used by the code interpreter or file search. Enable one of those tools for this agent, or upload a supported file type.`,
-    );
-  }
   if (destination.rejection === 'no-agent-resource') {
     throw new Error(
       `Files of type ${file.mimetype} cannot be saved to an agent on their own. Attach the file to a message, or enable the code interpreter or file search so the agent has somewhere to keep it.`,
@@ -742,7 +738,7 @@ const processAgentFileUpload = async ({ req, res, metadata, sseStream }) => {
   }
   effectiveToolResource = destination.toolResource;
 
-  if (effectiveToolResource === EToolResources.file_search && file.mimetype.startsWith('image')) {
+  if (effectiveToolResource && !canToolResourceConsume(effectiveToolResource, file.mimetype)) {
     throw new Error('Image uploads are not supported for file search tool resources');
   }
 
