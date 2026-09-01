@@ -13,7 +13,7 @@ import useAgentCapabilities from '~/hooks/Agents/useAgentCapabilities';
 import useGetAgentsConfig from '~/hooks/Agents/useGetAgentsConfig';
 import { useGetFileConfig } from '~/data-provider';
 import { ephemeralAgentByConvoId } from '~/store';
-import { getViableUploadOptions } from '~/utils';
+import { getViableUploadOptions, isUnifiedUploadMode } from '~/utils';
 import { useDragDropContext } from '~/Providers';
 import { isEphemeralAgent } from '~/common';
 
@@ -51,6 +51,7 @@ export default function useUploadOptions() {
 
   const endpointFileConfig = getEndpointFileConfig({ fileConfig, endpoint, endpointType });
   const uploadsDisabled = endpointFileConfig.disabled === true;
+  const isUnifiedMode = isUnifiedUploadMode(endpointFileConfig, isConfigPending);
   const endpointSupportedMimeTypes = endpointFileConfig.supportedMimeTypes;
 
   const getOptions = useCallback(
@@ -83,5 +84,5 @@ export default function useUploadOptions() {
     ],
   );
 
-  return { getOptions, uploadsDisabled, isConfigPending };
+  return { getOptions, uploadsDisabled, isConfigPending, isUnifiedMode };
 }
