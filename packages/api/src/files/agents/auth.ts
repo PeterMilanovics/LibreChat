@@ -48,14 +48,17 @@ export async function checkAgentUploadAuth(
   const { getAgent, checkPermission, hasUploadBypass } = deps;
 
   const isMessageAttachment = isMessageFileUpload(messageFile);
-  /* Any permanent upload against an agent can mutate that agent's resources, so it
-   * needs edit permission whether or not the request names a tool resource: unified
-   * uploads omit it and are promoted to a context resource during processing. Only
-   * message attachments, which belong to the conversation rather than the agent,
-   * skip the check. */
-  if (!agentId || isMessageAttachment) {
+  /* Any permanent upload against an agent can mutate that agent's resources, so it needs
+   * edit permission whether or not the request names a tool resource: unified uploads
+   * omit it and are promoted to a context resource during processing. A message
+   * attachment belongs to the conversation rather than the agent, so it needs only the
+   * access a conversation already implies, but it cannot skip the check outright: the
+   * upload is validated under the named agent's provider, and those responses describe a
+   * record the caller may not be allowed to see. */
+  if (!agentId) {
     return { allowed: true };
   }
+  const requiredPermission = isMessageAttachment ? PermissionBits.VIEW : PermissionBits.EDIT;
 
   /* Existence is established before any privilege shortcut. Returning early for a
    * privileged caller would let a stale agent id through to extraction and storage,
@@ -85,15 +88,15 @@ export async function checkAgentUploadAuth(
     return { allowed: true };
   }
 
-  const hasEditPermission = await checkPermission({
+  const hasPermission = await checkPermission({
     userId,
     role: userRole,
     resourceType: ResourceType.AGENT,
     resourceId: agent._id,
-    requiredPermission: PermissionBits.EDIT,
+    requiredPermission,
   });
 
-  if (hasEditPermission) {
+  if (hasPermission) {
     return { allowed: true };
   }
 
