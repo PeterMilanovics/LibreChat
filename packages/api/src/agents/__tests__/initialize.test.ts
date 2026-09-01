@@ -3020,9 +3020,7 @@ describe('initializeAgent — code-generated file thread filter (regression)', (
      * files rather than three. */
     const { primeResources } = jest.requireMock('../resources') as { primeResources: jest.Mock };
     const lastCall = primeResources.mock.calls[primeResources.mock.calls.length - 1];
-    const screen = lastCall?.[0].screenPersistentFiles as (
-      files: unknown[],
-    ) => unknown[];
+    const screen = lastCall?.[0].screenPersistentFiles as (files: unknown[]) => unknown[];
     filterFilesByEndpointRuntimeConfig.mockClear();
     filterFilesByEndpointRuntimeConfig.mockReturnValueOnce([]);
     screen([]);
