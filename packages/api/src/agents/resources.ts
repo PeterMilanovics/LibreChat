@@ -5,6 +5,7 @@ import {
   AgentCapabilities,
   FileContext,
   FileSources,
+  getCodeEnvRefs,
 } from 'librechat-data-provider';
 import type {
   AgentToolResources,
@@ -87,6 +88,11 @@ export type ProvisionState = {
   vectorDBFiles: TFile[];
   /** Set of file_ids confirmed alive in code env (from staleness check) */
   aliveFileIds: Set<string>;
+  /** The active agent's own resource files, which are the only ones provisioned under its
+   *  shared identity. A record carrying an agent context is not enough: a user may attach
+   *  another agent's setup file to this conversation, and provisioning it here would put
+   *  it in a namespace this agent's other users can read. */
+  agentScopedFileIds: Set<string>;
 };
 
 /**
@@ -166,11 +172,38 @@ export const addFileToResource = ({
  *  requesting user: provisioning those under a shared agent would copy one user's
  *  private file into a sandbox every other user of that agent can read. An allowlist
  *  fails safe, since an unrecognized context provisions per user rather than leaking. */
+
+/** Whether a file's existing vectors live under the agent's identity rather than the
+ *  user's. This reads where content already is, which the record's context records.
+ *  Where new provisioning may write is a separate question, answered by membership in
+ *  the active agent's resources. */
 const AGENT_SCOPED_FILE_CONTEXTS = new Set<string>([FileContext.agents]);
 
-/** Whether a file's tool provisioning is scoped to the agent rather than the user. */
 export const isAgentScopedFile = (file: Pick<TFile, 'context'>): boolean =>
   AGENT_SCOPED_FILE_CONTEXTS.has(file.context as string);
+
+/**
+ * Whether this file's vectors exist in the namespace the active agent will search.
+ *
+ * Agent-scoped files are embedded under `entity_id: <agentId>`, and a duplicated agent
+ * inherits the file id while searching its own namespace, so the record-wide `embedded`
+ * flag cannot answer this for them. Records embedded before namespaces were tracked carry
+ * no entity list and are re-embedded once per agent, which repairs the record as it goes.
+ */
+const isEmbeddedForNamespace = (file: TFile, agentId?: string): boolean => {
+  if (!isAgentScopedFile(file) || agentId == null) {
+    return file.embedded === true;
+  }
+  return file.metadata?.embeddedEntities?.includes(agentId) === true;
+};
+
+/**
+ * Whether this file already has a sandbox reference for the route the agent will execute
+ * on. A reference for another deployment does not make the file reachable here, so it has
+ * to be provisioned again rather than treated as done.
+ */
+const hasCodeRefForRoute = (file: TFile, routeKey: string): boolean =>
+  getCodeEnvRefs(file.metadata).some(([key]) => key === routeKey);
 
 /** Mirrors the lazy provisioning writer: agent-scoped search files live in
  *  `file_ids`, which is the only shape fileSearch treats as agent-owned. */
@@ -217,6 +250,7 @@ const categorizeFileForToolResources = ({
   requestFileSet,
   processedResourceFiles,
   agentScoped = false,
+  agentId,
 }: {
   file: TFile;
   tool_resources: AgentToolResources;
@@ -224,6 +258,8 @@ const categorizeFileForToolResources = ({
   processedResourceFiles: Set<string>;
   /** Whether this file's vectors were embedded under the agent's entity_id. */
   agentScoped?: boolean;
+  /** The agent whose vector namespace this turn will search, when one is scoped. */
+  agentId?: string;
 }): void => {
   if (file.metadata?.codeEnvRef || file.metadata?.codeEnvRefs) {
     addFileToResource({
@@ -234,7 +270,9 @@ const categorizeFileForToolResources = ({
     });
   }
 
-  if (file.embedded === true) {
+  /* Judged per namespace, not by the record-wide flag: registering a file this agent's
+   * namespace never received would make search query for vectors that are not there. */
+  if (isEmbeddedForNamespace(file, agentScoped ? agentId : undefined)) {
     /** Agent-scoped files are embedded under `entity_id: agentId`, so they must be
      *  reconstructed as `file_ids`: fileSearch's primeFiles only marks those
      *  `fromAgent` and only `fromAgent` queries carry the entity_id that can find
@@ -327,9 +365,15 @@ const computeProvisionState = async ({
   checkSessionsAlive,
   loadCodeApiKey,
   legacyFileUploadUX,
+  agentId,
+  codeRouteKey,
+  agentScopedFileIds,
 }: {
   req?: ServerRequest;
   attachments: Array<TFile>;
+  agentId?: string;
+  codeRouteKey?: string;
+  agentScopedFileIds?: ReadonlySet<string>;
   resourcePrincipal?: Pick<IUser, 'id' | 'role'>;
   enabledToolResources?: Set<EToolResources>;
   tool_resources: AgentToolResources;
@@ -394,6 +438,8 @@ const computeProvisionState = async ({
     });
   }
 
+  const activeCodeRouteKey = codeRouteKey ?? 'default';
+  const scopedIds = agentScopedFileIds ?? new Set<string>();
   const codeEnvFiles: TFile[] = [];
   const vectorDBFiles: TFile[] = [];
 
@@ -434,17 +480,20 @@ const computeProvisionState = async ({
           codeEnvRefs: Object.keys(remainingRefs).length > 0 ? remainingRefs : undefined,
         };
         codeEnvFiles.push(file);
+      } else if (!hasCodeRefForRoute(file, activeCodeRouteKey)) {
+        /* Judged by the active route rather than by any reference at all: a file
+         * provisioned to another deployment is not reachable from this one, and priming
+         * resolves only this route, so it would be omitted from the sandbox call. The
+         * pre-categorization pass marks such a file processed on the strength of the
+         * reference it does have, so the processed flag cannot gate this. */
+        codeEnvFiles.push(file);
       } else if (!processedResourceFiles.has(`${EToolResources.execute_code}:${file.file_id}`)) {
-        if (legacyRef == null) {
-          codeEnvFiles.push(file);
-        } else {
-          addFileToResource({
-            file,
-            resourceType: EToolResources.execute_code,
-            tool_resources,
-            processedResourceFiles,
-          });
-        }
+        addFileToResource({
+          file,
+          resourceType: EToolResources.execute_code,
+          tool_resources,
+          processedResourceFiles,
+        });
       }
     }
 
@@ -452,7 +501,7 @@ const computeProvisionState = async ({
     if (
       needsVectorDB &&
       !isImage &&
-      file.embedded !== true &&
+      !isEmbeddedForNamespace(file, agentId) &&
       !processedResourceFiles.has(`${EToolResources.file_search}:${file.file_id}`)
     ) {
       vectorDBFiles.push(file);
@@ -462,7 +511,12 @@ const computeProvisionState = async ({
   if (codeEnvFiles.length === 0 && vectorDBFiles.length === 0) {
     return undefined;
   }
-  return { codeEnvFiles, vectorDBFiles, aliveFileIds: aliveFileIds ?? new Set() };
+  return {
+    codeEnvFiles,
+    vectorDBFiles,
+    aliveFileIds: aliveFileIds ?? new Set(),
+    agentScopedFileIds: new Set(scopedIds),
+  };
 };
 
 export const primeResources = async ({
@@ -480,7 +534,8 @@ export const primeResources = async ({
   loadCodeApiKey,
   provisionCandidates,
   legacyFileUploadUX,
-  filterByEndpointPolicy,
+  screenPersistentFiles,
+  codeRouteKey,
 }: {
   req?: ServerRequest;
   principal?: Pick<IUser, 'id' | 'role'>;
@@ -503,11 +558,14 @@ export const primeResources = async ({
   provisionCandidates?: Array<TFile>;
   /** True when this endpoint still shows the explicit upload-destination chooser. */
   legacyFileUploadUX?: boolean;
-  /** Applies the current endpoint's file policy. Persistent agent files are read here
-   *  rather than by the caller, so the caller has no chance to filter them itself and
-   *  a provider or policy change since they were attached would otherwise let their
-   *  bytes reach the Code API or RAG. */
-  filterByEndpointPolicy?: (files: Array<TFile>) => Array<TFile>;
+  /** Applies the caller's endpoint and content policies. Persistent agent files are read
+   *  here rather than by the caller, so the caller has no chance to screen them itself
+   *  and a configuration or policy change since they were attached would otherwise let
+   *  their bytes reach the model, the Code API or RAG. */
+  screenPersistentFiles?: (files: Array<TFile>) => Array<TFile>;
+  /** The code deployment this turn will execute on, which decides whether an existing
+   *  sandbox reference is usable here. */
+  codeRouteKey?: string;
 }): Promise<{
   attachments: Array<TFile | undefined> | undefined;
   requestAttachments: Array<TFile | undefined> | undefined;
@@ -617,8 +675,8 @@ export const primeResources = async ({
         });
       }
 
-      if (filterByEndpointPolicy) {
-        persistedResourceFiles = filterByEndpointPolicy(persistedResourceFiles);
+      if (screenPersistentFiles) {
+        persistedResourceFiles = screenPersistentFiles(persistedResourceFiles);
       }
     }
 
@@ -636,6 +694,7 @@ export const primeResources = async ({
           requestFileSet,
           processedResourceFiles,
           agentScoped: agentId != null && isAgentScopedFile(file),
+          agentId,
         });
 
         attachments.push(file);
@@ -667,6 +726,9 @@ export const primeResources = async ({
         checkSessionsAlive,
         loadCodeApiKey,
         legacyFileUploadUX,
+        agentId,
+        codeRouteKey,
+        agentScopedFileIds: persistedResourceFileIds,
       });
       return {
         attachments: attachments.length > 0 ? attachments : undefined,
@@ -722,6 +784,9 @@ export const primeResources = async ({
       checkSessionsAlive,
       loadCodeApiKey,
       legacyFileUploadUX,
+      agentId,
+      codeRouteKey,
+      agentScopedFileIds: persistedResourceFileIds,
     });
 
     return {

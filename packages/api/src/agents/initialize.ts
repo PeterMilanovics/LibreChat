@@ -118,6 +118,29 @@ import { primeResources } from './resources';
  * manages overflow. `createRun` can further override this via `SummarizationConfig.reserveRatio`.
  */
 const DEFAULT_RESERVE_RATIO = 0.05;
+
+/**
+ * Bytes these files spend against the endpoint's total-size allowance, counting a file
+ * that appears in more than one set once. The sets overlap, an embedded attachment still
+ * missing the active code route being the case in point, and they are merged with the
+ * same deduplication downstream, so charging it twice spends an allowance the request
+ * never uses and drops another file that fits.
+ */
+function sumUniqueBytes(files: Array<{ file_id?: string; bytes?: number }>): number {
+  const seen = new Set<string>();
+  let total = 0;
+  for (const file of files) {
+    if (file.file_id != null) {
+      if (seen.has(file.file_id)) {
+        continue;
+      }
+      seen.add(file.file_id);
+    }
+    total += file.bytes ?? 0;
+  }
+  return total;
+}
+
 const temporalSpecialVarRegex = /{{\s*(current_date|current_datetime|iso_datetime)\s*}}/i;
 const geminiModelVersionRegex = /^gemini-(\d+)(?:\.(\d+))?(?:-|$)/;
 const googleToolCombinationTextModels = [
@@ -1027,9 +1050,22 @@ export async function initializeAgent(
 
   /** Build the set of tool resources the agent has enabled */
   const toolResourceSet = new Set<EToolResources>();
-  for (const tool of agent.tools ?? []) {
+  const addToolResource = (tool: string): void => {
     if (EToolResources[tool as keyof typeof EToolResources]) {
       toolResourceSet.add(EToolResources[tool as keyof typeof EToolResources]);
+    }
+  };
+  for (const tool of agent.tools ?? []) {
+    addToolResource(tool);
+  }
+  /* A skill's allowed-tools can contribute file_search or execute_code that the agent
+   * itself does not list. Eligibility has to reflect the effective tool set, or invoking
+   * the skill's tool searches or runs code with nothing provisioned. The primes are
+   * resolved above, so this needs no reordering, and the MCP name heal applied to the
+   * union later never rewrites these plain resource names. */
+  for (const prime of [...(manualSkillPrimes ?? []), ...(alwaysApplySkillPrimes ?? [])]) {
+    for (const tool of prime.allowedTools ?? []) {
+      addToolResource(tool);
     }
   }
 
@@ -1231,13 +1267,29 @@ export async function initializeAgent(
     if (deferredProvisionFiles.length > 0) {
       /* One request, one total-size allowance. Filtering each set from zero would let a
        * delivery attachment and a provisioning candidate that each fit alone exceed the
-       * limit together once withDeferredCandidates merges them. */
-      const deliveredBytes = (currentFiles ?? []).reduce((sum, file) => sum + (file.bytes ?? 0), 0);
+       * limit together once withDeferredCandidates merges them.
+       *
+       * A file can appear in both sets, an embedded attachment still missing the active
+       * code route being the case in point, and the merge deduplicates afterwards. Charging
+       * it twice would spend an allowance the request never uses and drop a different
+       * candidate that fits, so the shared ones are counted once. */
+      const deferredFileIds = new Set(
+        deferredProvisionFiles
+          .map((file) => file.file_id)
+          .filter((fileId): fileId is string => fileId != null),
+      );
       deferredProvisionFiles = filterFilesByEndpointRuntimeConfig(appConfig, {
         files: deferredProvisionFiles,
         endpoint: agent.endpoint ?? '',
         endpointType,
-        consumedBytes: deliveredBytes,
+        /* The deferred pass charges its own list as it walks it, so a file in both sets
+         * is counted there. Only what delivery spends on files the deferred pass will
+         * not see is carried in. */
+        consumedBytes: sumUniqueBytes(
+          (currentFiles ?? []).filter(
+            (file) => file.file_id == null || !deferredFileIds.has(file.file_id),
+          ),
+        ),
       }) as IMongoFile[];
     }
   }
@@ -1310,12 +1362,40 @@ export async function initializeAgent(
     loadCodeApiKey: db.loadCodeApiKey,
     provisionCandidates: deferredProvisionFiles as unknown as TFile[],
     legacyFileUploadUX,
-    filterByEndpointPolicy: (files) =>
-      filterFilesByEndpointRuntimeConfig(appConfig, {
+    codeRouteKey: codeExecutionContext.executionRouteKey ?? codeExecutionContext.executionProfile,
+    screenPersistentFiles: (files) => {
+      /* Persistent agent files are read inside primeResources, so they miss both checks
+       * the caller already applied to this turn's other files. They face the same
+       * endpoint policy under the remainder of the one total-size allowance the current
+       * and deferred sets have already drawn on, and the same content policy, which can
+       * have changed since the file was attached. */
+      const committedBytes = sumUniqueBytes([...(currentFiles ?? []), ...deferredProvisionFiles]);
+      const withinPolicy = filterFilesByEndpointRuntimeConfig(appConfig, {
         files: files as unknown as IMongoFile[],
         endpoint: agent.endpoint ?? '',
         endpointType: endpointFileType,
-      }) as unknown as TFile[],
+        consumedBytes: committedBytes,
+      }) as unknown as TFile[];
+
+      /* Dropped rather than fatal, matching the deferred candidates: these were not
+       * attached by this request, so refusing the conversation over a historical record
+       * would be harsher than leaving it out. */
+      return withinPolicy.filter((file) => {
+        try {
+          assertModelBoundContent({
+            filters: appConfig?.filters,
+            files: [file] as unknown as IMongoFile[],
+          });
+          return true;
+        } catch (error) {
+          logger.warn(
+            `[initializeAgent] Skipping persistent agent file "${file.filename}" (${file.file_id}): content policy`,
+            error,
+          );
+          return false;
+        }
+      });
+    },
   });
 
   /**

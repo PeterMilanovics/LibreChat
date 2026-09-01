@@ -1,5 +1,6 @@
 import type { TDefaultLLMDeliveryPathConfig } from './file-config';
 import {
+  resolveUploadDestination,
   resolveDefaultLLMDeliveryPath,
   SYSTEM_LLM_DELIVERY_DEFAULTS,
 } from './resolve-llm-delivery-path';
@@ -115,9 +116,78 @@ describe('resolveDefaultLLMDeliveryPath', () => {
     expect(resolveDefaultLLMDeliveryPath('audio/mpeg', undefined, undefined, 'azureOpenAI')).toBe(
       'text',
     );
+  });
+
+  it('keeps unsupported video off the model path rather than parsing it as text', () => {
+    /* Nothing extracts text from video: speech-to-text covers audio only, and the default
+     * text matcher accepts any well-formed type, so a downgrade to text ends in raw bytes
+     * decoded as UTF-8. */
     expect(resolveDefaultLLMDeliveryPath('video/mp4', undefined, undefined, 'azureOpenAI')).toBe(
-      'text',
+      'none',
     );
+    expect(resolveDefaultLLMDeliveryPath('video/mp4', undefined, undefined, 'anthropic')).toBe(
+      'none',
+    );
+  });
+
+  it('keeps archives and columnar data off the text fallback', () => {
+    /* These land on the text fallback rather than the capability gate, and the default
+     * text matcher accepts them, so they would be decoded as UTF-8 into the prompt. */
+    for (const mimeType of [
+      'application/zip',
+      'application/x-zip-compressed',
+      'application/x-tar',
+      'application/epub+zip',
+      'application/vnd.apache.parquet',
+      /* No built-in parser handles presentations or drawings, so without OCR they would
+       * reach the same raw-bytes fallback. */
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      'application/vnd.oasis.opendocument.presentation',
+      'application/vnd.oasis.opendocument.graphics',
+      /* Legacy DOC is absent from documentParserMimeTypes, so it has no parser either. */
+      'application/msword',
+    ]) {
+      expect(resolveDefaultLLMDeliveryPath(mimeType, undefined, undefined, 'openAI')).toBe('none');
+    }
+  });
+
+  it('keeps recoverable types on the text fallback', () => {
+    for (const mimeType of [
+      'text/plain',
+      'text/csv',
+      'application/json',
+      'application/vnd.oasis.opendocument.text',
+      'application/vnd.oasis.opendocument.spreadsheet',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.ms-excel',
+      'message/rfc822',
+    ]) {
+      expect(resolveDefaultLLMDeliveryPath(mimeType, undefined, undefined, 'openAI')).toBe('text');
+    }
+  });
+
+  it('still honors an explicit override for an unparsable type', () => {
+    expect(
+      resolveDefaultLLMDeliveryPath(
+        'application/zip',
+        { overrides: { 'application/zip': 'text' } },
+        undefined,
+        'openAI',
+      ),
+    ).toBe('text');
+  });
+
+  it('still honors an explicit override for video', () => {
+    /* Capability gating applies to the system default only; an admin who configures a
+     * destination has made the decision. */
+    expect(
+      resolveDefaultLLMDeliveryPath(
+        'video/mp4',
+        { overrides: { 'video/*': 'text' } },
+        undefined,
+        'anthropic',
+      ),
+    ).toBe('text');
   });
 
   it('keeps provider delivery for endpoints that do support documents', () => {
@@ -126,11 +196,8 @@ describe('resolveDefaultLLMDeliveryPath', () => {
     );
   });
 
-  it('routes media to text for document-capable providers without media encoders', () => {
+  it('routes transcribable media to text for providers without media encoders', () => {
     expect(resolveDefaultLLMDeliveryPath('audio/mpeg', undefined, undefined, 'openAI')).toBe(
-      'text',
-    );
-    expect(resolveDefaultLLMDeliveryPath('video/mp4', undefined, undefined, 'anthropic')).toBe(
       'text',
     );
     expect(resolveDefaultLLMDeliveryPath('application/pdf', undefined, undefined, 'openAI')).toBe(
@@ -215,5 +282,71 @@ describe('resolveDefaultLLMDeliveryPath', () => {
       'audio/*': 'provider',
       'application/pdf': 'provider',
     });
+  });
+});
+
+describe('resolveUploadDestination', () => {
+  const base = { mimeType: 'application/zip', hasAgent: true, isMessageAttachment: false };
+
+  it('keeps an explicit resource and normalizes ocr to context', () => {
+    expect(
+      resolveUploadDestination({ ...base, toolResource: 'ocr', deliveryPath: 'text' }).toolResource,
+    ).toBe('context');
+    expect(
+      resolveUploadDestination({ ...base, toolResource: 'file_search', deliveryPath: 'none' })
+        .toolResource,
+    ).toBe('file_search');
+  });
+
+  it('promotes a text-routed upload to context', () => {
+    expect(resolveUploadDestination({ ...base, deliveryPath: 'text' }).toolResource).toBe(
+      'context',
+    );
+  });
+
+  it('refuses a type no enabled tool can read', () => {
+    expect(
+      resolveUploadDestination({ ...base, deliveryPath: 'none', agentTools: [] }).rejection,
+    ).toBe('no-consumer');
+  });
+
+  it('does not judge an unknown tool set', () => {
+    /* An ephemeral agent has no record, so its tools are unknown rather than absent. */
+    expect(resolveUploadDestination({ ...base, deliveryPath: 'none' }).rejection).toBe(
+      'no-agent-resource',
+    );
+    expect(
+      resolveUploadDestination({ ...base, deliveryPath: 'none', isMessageAttachment: true })
+        .rejection,
+    ).toBeUndefined();
+  });
+
+  it('files a permanent upload under the tool that will consume it', () => {
+    expect(
+      resolveUploadDestination({ ...base, deliveryPath: 'none', agentTools: ['execute_code'] })
+        .toolResource,
+    ).toBe('execute_code');
+  });
+
+  it('refuses a permanent upload that would land on no agent resource', () => {
+    expect(
+      resolveUploadDestination({
+        ...base,
+        mimeType: 'image/png',
+        deliveryPath: 'provider',
+        agentTools: [],
+      }).rejection,
+    ).toBe('no-agent-resource');
+  });
+
+  it('leaves a message attachment unclaimed', () => {
+    expect(
+      resolveUploadDestination({
+        ...base,
+        mimeType: 'image/png',
+        deliveryPath: 'provider',
+        isMessageAttachment: true,
+      }),
+    ).toEqual({});
   });
 });

@@ -28,8 +28,17 @@ function makeFile(overrides: Partial<TFile> = {}): TFile {
   } as TFile;
 }
 
-function state(codeEnvFiles: TFile[], vectorDBFiles: TFile[]): ProvisionState {
-  return { codeEnvFiles, vectorDBFiles, aliveFileIds: new Set<string>() };
+function state(
+  codeEnvFiles: TFile[],
+  vectorDBFiles: TFile[],
+  agentScopedFileIds: string[] = [],
+): ProvisionState {
+  return {
+    codeEnvFiles,
+    vectorDBFiles,
+    aliveFileIds: new Set<string>(),
+    agentScopedFileIds: new Set(agentScopedFileIds),
+  };
 }
 
 function buildHarness({
@@ -68,6 +77,7 @@ function buildHarness({
     }));
   const updateFile = jest.fn(async () => ({}));
   const updateCodeEnvRef = jest.fn(async () => ({}));
+  const addEmbeddedEntity = jest.fn(async () => ({}));
   const agentToolContexts = new Map<string, ProvisionToolContext>(contexts);
 
   return {
@@ -75,6 +85,7 @@ function buildHarness({
     provisionToVectorDB,
     updateFile,
     updateCodeEnvRef,
+    addEmbeddedEntity,
     agentToolContexts,
     provisionFiles: createProvisionFilesCallback({
       req,
@@ -83,11 +94,34 @@ function buildHarness({
       provisionToVectorDB: provisionToVectorDB as never,
       updateFile,
       updateCodeEnvRef,
+      addEmbeddedEntity,
     }),
   };
 }
 
 describe('createProvisionFilesCallback', () => {
+  it('scopes only the agent own resource files to its identity', async () => {
+    /* A user can attach another agent's setup file to this conversation. Uploading it under
+     * this agent would place it in a namespace this agent's other users share, so the
+     * upload identity comes from membership in this agent's resources. */
+    const own = makeFile({ file_id: 'own-file', context: FileContext.agents });
+    const foreign = makeFile({ file_id: 'foreign-file', context: FileContext.agents });
+    const { provisionFiles, provisionToCodeEnv } = buildHarness({
+      contexts: [['agent-a', { provisionState: state([own, foreign], [], ['own-file']) }]],
+    });
+
+    await provisionFiles([Constants.EXECUTE_CODE], 'agent-a');
+
+    const byFile = new Map(
+      provisionToCodeEnv.mock.calls.map(([args]) => [
+        (args as { file: TFile }).file.file_id,
+        (args as { entity_id?: string }).entity_id,
+      ]),
+    );
+    expect(byFile.get('own-file')).toBe('agent-a');
+    expect(byFile.get('foreign-file')).toBeUndefined();
+  });
+
   it('provisions once for the request when two agents queue the same file', async () => {
     const shared = makeFile();
     const contexts: Array<[string, ProvisionToolContext]> = [
@@ -288,6 +322,22 @@ describe('createProvisionFilesCallback', () => {
 
     await expect(provisionFiles([Constants.EXECUTE_CODE], 'agent-a')).resolves.toHaveLength(1);
     expect(codeImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('treats a declined embedding as a failure rather than a result', async () => {
+    /* The service resolves with embedded false when the vector store declines the file.
+     * That means the vectors are absent just as a throw does, so the file has to stay
+     * queued instead of search proceeding without it. */
+    const vectorImpl = jest.fn(async () => ({ embedded: false, fileUpdate: null }));
+    const { provisionFiles, agentToolContexts } = buildHarness({
+      contexts: [['agent-a', { provisionState: state([], [makeFile()]) }]],
+      vectorImpl,
+    });
+
+    await expect(provisionFiles(['file_search'], 'agent-a')).rejects.toThrow(
+      /aborting tool execution rather than searching without them/,
+    );
+    expect(agentToolContexts.get('agent-a')?.provisionState?.vectorDBFiles).toHaveLength(1);
   });
 
   it('aborts the turn when search provisioning fails', async () => {

@@ -1,4 +1,5 @@
 import type { TDefaultLLMDeliveryPath, TDefaultLLMDeliveryPathConfig } from './file-config';
+import type { EndpointFileConfig, FileConfig } from './types/files';
 import {
   EModelEndpoint,
   isDocumentSupportedProvider,
@@ -6,6 +7,7 @@ import {
   isMediaSupportedProvider,
 } from './schemas';
 import { isBedrockDocumentType } from './file-config';
+import { EToolResources } from './types/assistants';
 
 /** Audio and video reach the model only through the media encoders, which support a
  *  narrower provider set than documents. Images use the broadly supported vision
@@ -29,6 +31,45 @@ export const SYSTEM_LLM_DELIVERY_DEFAULTS: Required<TDefaultLLMDeliveryPathConfi
     'application/pdf': 'provider',
   },
 };
+
+/**
+ * Types some step in the upload pipeline can turn into text: natively readable text,
+ * documents a parser or OCR handles, images through OCR, and audio through transcription.
+ *
+ * Everything absent from this list, notably archives, tarballs, columnar data files and
+ * video, has no such step, and the default text matcher accepts any well-formed type, so
+ * routing them to text ends in their bytes being decoded as UTF-8.
+ */
+const TEXT_RECOVERABLE_MIME_TYPES: RegExp[] = [
+  /^text\//,
+  /^image\//,
+  /^audio\//,
+  /^application\/(json|xml|sql|yaml|csv|typescript|x-sh|vnd\.coffeescript)$/,
+  /^application\/pdf$/,
+  /* Only the formats the built-in document parser handles. Presentations and graphics
+   * are absent from documentParserMimeTypes, so on a deployment without OCR they would
+   * fall through to the permissive text matcher and be decoded as ZIP bytes. */
+  /^application\/vnd\.openxmlformats-officedocument\.(wordprocessingml\.document|spreadsheetml\.sheet)$/,
+  /^application\/vnd\.oasis\.opendocument\.(text|spreadsheet)$/,
+  /^application\/(vnd\.ms-excel|x-msexcel|msexcel|x-ms-excel|x-excel|x-dos_ms_excel|xls|x-xls)$/,
+  /^message\/rfc822$/,
+];
+
+/**
+ * Types whose bytes are text already, so reading them directly is meaningful. Everything
+ * else needs a real extractor: decoding it as UTF-8 produces mojibake rather than content.
+ */
+export function isNativelyReadableText(mimeType: string): boolean {
+  return (
+    /^text\//.test(mimeType) ||
+    /^application\/(json|xml|sql|yaml|csv|typescript|x-sh|vnd\.coffeescript)$/.test(mimeType) ||
+    mimeType === 'message/rfc822'
+  );
+}
+
+export function hasTextExtractionPath(mimeType: string): boolean {
+  return TEXT_RECOVERABLE_MIME_TYPES.some((pattern) => pattern.test(mimeType));
+}
 
 /**
  * Resolves the default file path destination for a given mime type.
@@ -84,7 +125,12 @@ export function resolveDefaultLLMDeliveryPath(
   const providerKnown =
     endpoint != null && endpoint !== EModelEndpoint.agents && isKnownProviderIdentifier(endpoint);
   if (systemDefault === 'provider' && providerKnown && !isProviderCapable(mimeType, endpoint)) {
-    return 'text';
+    /* Downgrading is only useful where text can actually be recovered. Video has no
+     * extraction step: speech-to-text covers audio, and the default text matcher accepts
+     * any well-formed MIME type, so routing it to text ends in the raw bytes being
+     * decoded as UTF-8 and handed to the model. Keep it off the model path instead; the
+     * file is still stored and still reachable by tools. */
+    return hasTextExtractionPath(mimeType) ? 'text' : 'none';
   }
 
   /** Bedrock's Converse document path natively accepts more than PDF, so on that
@@ -98,5 +144,122 @@ export function resolveDefaultLLMDeliveryPath(
     return 'provider';
   }
 
+  /* The text fallback is only meaningful where text can be recovered. An archive or a
+   * columnar data file reaching it would be decoded as UTF-8 into the prompt, so keep it
+   * off the model path instead; the file is still stored and reachable by tools. An
+   * explicit configuration above has already returned, so this governs the system default
+   * alone. */
+  if (systemDefault === 'text' && !hasTextExtractionPath(mimeType)) {
+    return 'none';
+  }
+
   return systemDefault;
+}
+
+/**
+ * Delivery path for an upload that named no tool resource. The legacy chooser makes the
+ * destination explicit, so nothing is inferred there.
+ */
+export function resolveDefaultUploadLLMDeliveryPath({
+  mimeType,
+  endpointConfig,
+  fileConfig,
+  endpoint,
+}: {
+  mimeType: string;
+  endpointConfig?: EndpointFileConfig;
+  fileConfig?: FileConfig;
+  endpoint?: string;
+}): TDefaultLLMDeliveryPath {
+  if (endpointConfig?.legacyFileUploadUX === true) {
+    return 'provider';
+  }
+  return resolveDefaultLLMDeliveryPath(
+    mimeType,
+    endpointConfig?.defaultLLMDeliveryPath,
+    fileConfig?.defaultLLMDeliveryPath,
+    endpoint,
+  );
+}
+
+/** Delivery path for an upload, honoring an explicitly chosen tool resource. */
+export function resolveUploadLLMDeliveryPath({
+  toolResource,
+  mimeType,
+  endpointConfig,
+  fileConfig,
+  endpoint,
+}: {
+  toolResource?: string | null;
+  mimeType: string;
+  endpointConfig?: EndpointFileConfig;
+  fileConfig?: FileConfig;
+  endpoint?: string;
+}): TDefaultLLMDeliveryPath {
+  if (toolResource === EToolResources.context || toolResource === EToolResources.ocr) {
+    return 'text';
+  }
+  if (toolResource === EToolResources.file_search || toolResource === EToolResources.execute_code) {
+    return 'none';
+  }
+  return resolveDefaultUploadLLMDeliveryPath({ mimeType, endpointConfig, fileConfig, endpoint });
+}
+
+/** Why an upload cannot be accepted, when nothing would be able to read it. */
+export type UploadRejection = 'no-consumer' | 'no-agent-resource';
+
+/**
+ * Where a unified upload will end up, and whether it can be accepted at all.
+ *
+ * An upload has to be readable by something: the model, an extraction step, or a file
+ * tool. A permanent one has to land on an agent resource too, or storing it succeeds
+ * while leaving the agent no reference to it. Both outcomes are decided here rather than
+ * discovered later, so a request that would change nothing is refused with a reason.
+ *
+ * `agentTools` is undefined when no agent record backs the upload, as for an ephemeral
+ * agent that exists only for the request. An unknown tool set is not judged.
+ */
+export function resolveUploadDestination(params: {
+  toolResource?: string | null;
+  deliveryPath: TDefaultLLMDeliveryPath;
+  mimeType: string;
+  agentTools?: string[];
+  hasAgent: boolean;
+  isMessageAttachment: boolean;
+}): { toolResource?: string; rejection?: UploadRejection } {
+  const { toolResource, deliveryPath, mimeType, agentTools, hasAgent, isMessageAttachment } =
+    params;
+
+  if (toolResource) {
+    return {
+      toolResource:
+        toolResource === EToolResources.ocr ? EToolResources.context : (toolResource as string),
+    };
+  }
+
+  if (deliveryPath === 'text') {
+    return { toolResource: EToolResources.context };
+  }
+
+  const consumingTool = agentTools?.find(
+    (tool) => tool === EToolResources.execute_code || tool === EToolResources.file_search,
+  );
+
+  if (deliveryPath === 'none' && !hasTextExtractionPath(mimeType)) {
+    /* An administrator who routes a readable type to none has chosen tool-only access
+     * deliberately and is warned about it at boot, so only unreadable types are refused. */
+    if (agentTools != null && consumingTool == null) {
+      return { rejection: 'no-consumer' };
+    }
+  }
+
+  if (!isMessageAttachment && deliveryPath === 'none' && consumingTool) {
+    return { toolResource: consumingTool };
+  }
+
+  if (hasAgent && !isMessageAttachment) {
+    return { rejection: 'no-agent-resource' };
+  }
+
+  return {};
 }

@@ -111,6 +111,20 @@ jest.mock('../resources', () => ({
   }),
 }));
 
+jest.mock('../../middleware/modelBoundContent', () => {
+  const actual = jest.requireActual('../../middleware/modelBoundContent');
+  /* Real by default; a single test overrides it to stand in for a policy that started
+   * refusing a file after it was attached. */
+  return {
+    ...actual,
+    assertModelBoundContent: jest.fn((...args: unknown[]) =>
+      (actual as { assertModelBoundContent: (...a: unknown[]) => void }).assertModelBoundContent(
+        ...args,
+      ),
+    ),
+  };
+});
+
 import { initializeAgent } from '../initialize';
 import { isFatalAgentInitializationError } from '../errors';
 
@@ -2953,6 +2967,151 @@ describe('initializeAgent — code-generated file thread filter (regression)', (
      * so it shouldn't be invoked at all. `getCodeGeneratedFiles`'s own
      * empty-guard is exercised by data-schemas tests. */
     expect(getUserCodeFiles).not.toHaveBeenCalled();
+  });
+
+  it('charges a file appearing in both sets against the allowance once', async () => {
+    /* An embedded attachment still missing the active code route is hydrated for delivery
+     * and returned as a provisioning candidate. Charging its bytes twice would spend an
+     * allowance the request never uses and drop a different candidate that fits. */
+    const { filterFilesByEndpointRuntimeConfig } = jest.requireMock('~/files') as {
+      filterFilesByEndpointRuntimeConfig: jest.Mock;
+    };
+    const shared = { file_id: 'shared', filename: 'a.csv', bytes: 400 };
+    const deferredOnly = { file_id: 'deferred', filename: 'b.csv', bytes: 100 };
+    const { agent, req, res, loadTools, db } = setupExecuteCodeAgent();
+
+    /* Delivery keeps the shared file; the deferred pass keeps both. */
+    filterFilesByEndpointRuntimeConfig
+      .mockReturnValueOnce([shared])
+      .mockReturnValueOnce([shared, deferredOnly]);
+    const getDeferredProvisionFiles = jest.fn().mockResolvedValue([shared, deferredOnly]);
+    const getConvoFiles = jest.fn().mockResolvedValue(['shared', 'deferred']);
+    const getToolFilesByIds = jest.fn().mockResolvedValue([shared]);
+
+    await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        conversationId: 'conv-1',
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+        codeEnvAvailable: true,
+      },
+      {
+        ...db,
+        getDeferredProvisionFiles,
+        getConvoFiles,
+        getToolFilesByIds,
+        getFiles: jest.fn().mockResolvedValue([shared, deferredOnly]),
+      },
+    );
+
+    const chargedToDeferred = filterFilesByEndpointRuntimeConfig.mock.calls
+      .map(([, params]) => (params as { consumedBytes?: number }).consumedBytes)
+      .find((bytes) => bytes !== undefined);
+    /* The only delivered file is also the shared one, and the deferred pass charges its
+     * own list as it walks it, so nothing is carried in. */
+    expect(chargedToDeferred).toBe(0);
+
+    /* The persistent screening runs inside the callback, and must see the two unique
+     * files rather than three. */
+    const { primeResources } = jest.requireMock('../resources') as { primeResources: jest.Mock };
+    const lastCall = primeResources.mock.calls[primeResources.mock.calls.length - 1];
+    const screen = lastCall?.[0].screenPersistentFiles as (
+      files: unknown[],
+    ) => unknown[];
+    filterFilesByEndpointRuntimeConfig.mockClear();
+    filterFilesByEndpointRuntimeConfig.mockReturnValueOnce([]);
+    screen([]);
+    expect(filterFilesByEndpointRuntimeConfig).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ consumedBytes: 500 }),
+    );
+  });
+
+  it('screens persistent agent files under the remaining size allowance and content policy', async () => {
+    /* These are read inside primeResources, so the caller never sees them. Both checks it
+     * applied to this turn's other files have to reach them through the callback. */
+    const { filterFilesByEndpointRuntimeConfig } = jest.requireMock('~/files') as {
+      filterFilesByEndpointRuntimeConfig: jest.Mock;
+    };
+    const { primeResources } = jest.requireMock('../resources') as { primeResources: jest.Mock };
+    const { agent, req, res, loadTools, db } = setupExecuteCodeAgent();
+
+    await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+        codeEnvAvailable: true,
+      },
+      db,
+    );
+
+    const screen = primeResources.mock.calls[0][0].screenPersistentFiles as (
+      files: unknown[],
+    ) => unknown[];
+    expect(typeof screen).toBe('function');
+
+    filterFilesByEndpointRuntimeConfig.mockClear();
+    const persistent = [{ file_id: 'persistent-1', filename: 'notes.csv', bytes: 10 }];
+    filterFilesByEndpointRuntimeConfig.mockReturnValueOnce(persistent);
+
+    expect(screen(persistent)).toEqual(persistent);
+    expect(filterFilesByEndpointRuntimeConfig).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ consumedBytes: expect.any(Number) }),
+    );
+  });
+
+  it('drops a persistent agent file the content policy now refuses', async () => {
+    const { filterFilesByEndpointRuntimeConfig } = jest.requireMock('~/files') as {
+      filterFilesByEndpointRuntimeConfig: jest.Mock;
+    };
+    const { primeResources } = jest.requireMock('../resources') as { primeResources: jest.Mock };
+    const { assertModelBoundContent } = jest.requireMock('../../middleware/modelBoundContent') as {
+      assertModelBoundContent: jest.Mock;
+    };
+    const { agent, req, res, loadTools, db } = setupExecuteCodeAgent();
+
+    await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+        codeEnvAvailable: true,
+      },
+      db,
+    );
+
+    const screen = primeResources.mock.calls[0][0].screenPersistentFiles as (
+      files: unknown[],
+    ) => unknown[];
+    const persistent = [
+      {
+        file_id: 'blocked-1',
+        filename: 'secrets.bin',
+        bytes: 10,
+        type: 'application/octet-stream',
+      },
+    ];
+    filterFilesByEndpointRuntimeConfig.mockReturnValueOnce(persistent);
+    assertModelBoundContent.mockImplementationOnce(() => {
+      throw new Error('content policy');
+    });
+
+    expect(screen(persistent)).toEqual([]);
   });
 
   it('finds deferred files from the conversation when no anchor is supplied', async () => {

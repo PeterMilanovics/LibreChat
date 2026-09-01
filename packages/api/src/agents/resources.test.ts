@@ -10,7 +10,7 @@ import type { TAgentsEndpoint, TFile } from 'librechat-data-provider';
 import type { IUser, AppConfig } from '@librechat/data-schemas';
 import type { Request as ServerRequest } from 'express';
 import type { TGetFiles, TFilterFilesByAgentAccess } from './resources';
-import { primeResources, isAgentScopedFile } from './resources';
+import { primeResources } from './resources';
 
 // Mock logger
 jest.mock('@librechat/data-schemas', () => ({
@@ -97,7 +97,56 @@ describe('primeResources', () => {
     });
   });
 
-  describe('when the endpoint policy rejects a persistent context file', () => {
+  describe('embedding state across agents that share a file record', () => {
+    const sharedContextFile = (embeddedEntities?: string[]): TFile =>
+      ({
+        user: 'user1',
+        file_id: 'shared-context-file',
+        filename: 'notes.pdf',
+        filepath: '/uploads/notes.pdf',
+        object: 'file' as const,
+        type: 'application/pdf',
+        bytes: 1024,
+        usage: 0,
+        embedded: true,
+        source: FileSources.local,
+        context: FileContext.agents,
+        ...(embeddedEntities ? { metadata: { embeddedEntities } } : {}),
+      }) as TFile;
+
+    const primeFor = (agentId: string, file: TFile) => {
+      mockGetFiles.mockResolvedValue([file]);
+      return primeResources({
+        req: mockReq,
+        appConfig: mockAppConfig,
+        getFiles: mockGetFiles,
+        filterFiles: mockFilterFiles,
+        requestFileSet,
+        attachments: undefined,
+        tool_resources: { [EToolResources.context]: { file_ids: ['shared-context-file'] } },
+        agentId,
+        enabledToolResources: new Set([EToolResources.file_search]),
+      });
+    };
+
+    it('re-embeds for an agent whose namespace was never provisioned', async () => {
+      /* A duplicated agent inherits the file id but searches its own namespace, so the
+       * record-wide embedded flag cannot answer for it. */
+      const result = await primeFor('agent-b', sharedContextFile(['agent-a']));
+
+      expect(result.provisionState?.vectorDBFiles.map((f) => f.file_id)).toEqual([
+        'shared-context-file',
+      ]);
+    });
+
+    it('does not re-embed for the agent that already provisioned it', async () => {
+      const result = await primeFor('agent-a', sharedContextFile(['agent-a']));
+
+      expect(result.provisionState).toBeUndefined();
+    });
+  });
+
+  describe('when policy screening rejects a persistent context file', () => {
     it('keeps it out of provisioning and out of attachments', async () => {
       /* These files are read inside primeResources, so the caller never sees them to
        * filter. A provider or policy change since they were attached must still stop
@@ -128,7 +177,7 @@ describe('primeResources', () => {
         tool_resources: { [EToolResources.context]: { file_ids: ['stale-context-file'] } },
         agentId: 'agent_test',
         enabledToolResources: new Set([EToolResources.execute_code, EToolResources.file_search]),
-        filterByEndpointPolicy: () => [],
+        screenPersistentFiles: () => [],
       });
 
       expect(result.provisionState).toBeUndefined();
@@ -162,7 +211,7 @@ describe('primeResources', () => {
         tool_resources: { [EToolResources.context]: { file_ids: ['live-context-file'] } },
         agentId: 'agent_test',
         enabledToolResources: new Set([EToolResources.execute_code, EToolResources.file_search]),
-        filterByEndpointPolicy: (files) => files,
+        screenPersistentFiles: (files) => files,
       });
 
       expect(result.provisionState?.codeEnvFiles.map((f) => f.file_id)).toEqual([
@@ -2170,12 +2219,49 @@ describe('primeResources', () => {
         agentId: 'agent1',
         enabledToolResources: new Set([EToolResources.execute_code]),
         checkSessionsAlive,
+        /* The agent runs on the same route the ref names, so the file is already usable
+         * and the probe has nothing to clear. */
+        codeRouteKey: 'stateful:abc',
       });
 
       expect(checkSessionsAlive).not.toHaveBeenCalled();
       expect(result.provisionState).toBeUndefined();
       expect(statefulFile.metadata?.codeEnvRef).toEqual(statefulRef);
       expect(statefulFile.metadata?.codeEnvRefs?.['stateful:abc']).toEqual(statefulRef);
+    });
+
+    it('queues a file whose only reference names another code route', async () => {
+      /* Priming resolves the active route alone, so a reference to a different deployment
+       * would leave the sandbox call without the attachment. */
+      const otherRouteRef = {
+        kind: 'user' as const,
+        id: 'user1',
+        storage_session_id: 'sess-a',
+        file_id: 'remote-a',
+        executionProfile: 'stateful' as const,
+        executionRouteKey: 'stateful:a',
+      };
+      const otherRouteFile = makeCodeFile({
+        file_id: 'other-route-file',
+        metadata: { codeEnvRef: otherRouteRef, codeEnvRefs: { 'stateful:a': otherRouteRef } },
+      });
+
+      const result = await primeResources({
+        req: mockReq,
+        appConfig: mockAppConfig,
+        getFiles: mockGetFiles,
+        filterFiles: mockFilterFiles,
+        tool_resources: {},
+        attachments: Promise.resolve([otherRouteFile]),
+        requestFileSet,
+        agentId: 'agent1',
+        enabledToolResources: new Set([EToolResources.execute_code]),
+        codeRouteKey: 'stateful:b',
+      });
+
+      expect(result.provisionState?.codeEnvFiles.map((f) => f.file_id)).toEqual([
+        'other-route-file',
+      ]);
     });
 
     it('queues persistent context files on a turn with no request attachments', async () => {
@@ -2221,7 +2307,8 @@ describe('primeResources', () => {
         embedded: true,
         usage: 0,
         context: FileContext.agents,
-      };
+        metadata: { embeddedEntities: ['agent1'] },
+      } as TFile;
       mockGetFiles.mockResolvedValue([embeddedContextFile]);
 
       const result = await primeResources({
@@ -2238,6 +2325,41 @@ describe('primeResources', () => {
       const searchResource = result.tool_resources?.[EToolResources.file_search];
       expect(searchResource?.file_ids).toContain('embedded-context');
       expect(searchResource?.files?.map((f) => f.file_id) ?? []).not.toContain('embedded-context');
+    });
+
+    it('re-embeds an agent context file recorded before namespaces were tracked', async () => {
+      /* Records predating per-namespace tracking cannot say which agent holds their
+       * vectors, so they are provisioned once for the agent that next uses them and carry
+       * the namespace afterwards. */
+      const legacyContextFile = {
+        user: 'user1',
+        file_id: 'legacy-context',
+        filename: 'handbook.pdf',
+        filepath: '/uploads/handbook.pdf',
+        object: 'file',
+        type: 'application/pdf',
+        bytes: 2048,
+        embedded: true,
+        usage: 0,
+        context: FileContext.agents,
+      } as TFile;
+      mockGetFiles.mockResolvedValue([legacyContextFile]);
+
+      const result = await primeResources({
+        req: mockReq,
+        appConfig: mockAppConfig,
+        getFiles: mockGetFiles,
+        filterFiles: mockFilterFiles,
+        tool_resources: { [EToolResources.context]: { file_ids: ['legacy-context'] } },
+        attachments: undefined,
+        requestFileSet,
+        agentId: 'agent1',
+        enabledToolResources: new Set([EToolResources.file_search]),
+      });
+
+      expect(result.provisionState?.vectorDBFiles.map((f) => f.file_id)).toEqual([
+        'legacy-context',
+      ]);
     });
 
     it('queues a deferred candidate for provisioning without delivering it again', async () => {
@@ -2304,14 +2426,32 @@ describe('primeResources', () => {
       expect(result.attachments?.map((f) => f?.file_id)).toContain('text-record');
     });
 
-    it('grants agent scope only to agent setup files', () => {
-      expect(isAgentScopedFile({ context: FileContext.agents })).toBe(true);
-      expect(isAgentScopedFile({ context: FileContext.execute_code })).toBe(false);
-      expect(isAgentScopedFile({ context: FileContext.message_attachment })).toBe(false);
-      expect(isAgentScopedFile({ context: FileContext.image_generation })).toBe(false);
-      expect(isAgentScopedFile({ context: FileContext.assistants_output })).toBe(false);
-      expect(isAgentScopedFile({ context: FileContext.unknown })).toBe(false);
-      expect(isAgentScopedFile({ context: undefined })).toBe(false);
+    it('grants agent scope only to the active agent own resource files', async () => {
+      /* A user who owns another agent's setup file can attach it here. Scoping it to this
+       * agent would provision it under an identity this agent's other users share, so the
+       * record's context is not enough: membership in this agent's resources decides. */
+      const foreignSetupFile = makeCodeFile({
+        file_id: 'foreign-agent-file',
+        context: FileContext.agents,
+      });
+      const ownSetupFile = makeCodeFile({ file_id: 'own-agent-file', context: FileContext.agents });
+      mockGetFiles.mockResolvedValue([ownSetupFile]);
+
+      const result = await primeResources({
+        req: mockReq,
+        appConfig: mockAppConfig,
+        getFiles: mockGetFiles,
+        filterFiles: mockFilterFiles,
+        tool_resources: { [EToolResources.context]: { file_ids: ['own-agent-file'] } },
+        attachments: Promise.resolve([foreignSetupFile]),
+        requestFileSet,
+        agentId: 'agent1',
+        enabledToolResources: new Set([EToolResources.execute_code]),
+      });
+
+      const scoped = result.provisionState?.agentScopedFileIds;
+      expect(scoped?.has('own-agent-file')).toBe(true);
+      expect(scoped?.has('foreign-agent-file')).toBe(false);
     });
 
     it('rebuilds an embedded code output under files, not agent file_ids', async () => {

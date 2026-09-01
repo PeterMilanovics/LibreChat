@@ -244,6 +244,7 @@ const {
   processFileURL,
   sweepExpiredFiles,
   startExpiredFileSweep,
+  filterFile,
 } = require('./process');
 const {
   inspectContent,
@@ -1565,9 +1566,10 @@ describe('processAgentFileUpload', () => {
       );
     });
 
-    test('resolves llmDeliveryPath from the agent provider config for agent uploads', async () => {
-      const { createFile, getAgent } = require('~/models');
-      getAgent.mockResolvedValueOnce({ provider: 'Custom Provider' });
+    test('routes under the provider endpoint the caller resolved', async () => {
+      /* The route resolves the agent's provider once, before validation, and hands it
+       * down so acceptance and routing use one configuration. */
+      const { createFile } = require('~/models');
       const storageUpload = jest.fn().mockResolvedValue({
         filepath: '/uploads/user-123/file-uuid-123__upload.bin',
         bytes: 128,
@@ -1591,10 +1593,10 @@ describe('processAgentFileUpload', () => {
           agent_id: 'agent-abc',
           message_file: 'true',
           file_id: 'file-uuid-123',
+          effectiveEndpoint: 'Custom Provider',
         },
       });
 
-      expect(getAgent).toHaveBeenCalledWith({ id: 'agent-abc' });
       expect(createFile).toHaveBeenCalledWith(
         expect.objectContaining({ llmDeliveryPath: 'none' }),
         true,
@@ -1845,9 +1847,8 @@ describe('processImageFile', () => {
     );
   });
 
-  test('resolves llmDeliveryPath from the agent provider config for agent image uploads', async () => {
-    const { createFile, getAgent } = require('~/models');
-    getAgent.mockResolvedValueOnce({ provider: 'Custom Provider' });
+  test('routes an agent image under the provider endpoint the caller resolved', async () => {
+    const { createFile } = require('~/models');
     const handleImageUpload = jest.fn().mockResolvedValue({
       filepath: '/images/user-123/image.webp',
       bytes: 256,
@@ -1870,10 +1871,12 @@ describe('processImageFile', () => {
         file_id: 'image-file-id',
         agent_id: 'agent-abc',
         endpoint: EModelEndpoint.agents,
+        effectiveEndpoint: 'Custom Provider',
       },
     });
 
-    expect(getAgent).toHaveBeenCalledWith({ id: 'agent-abc' });
+    /* Storage still keys off the request endpoint; only delivery routing follows the
+     * resolved provider. */
     expect(handleImageUpload).toHaveBeenCalledWith(
       expect.objectContaining({ endpoint: EModelEndpoint.agents }),
     );
@@ -2408,5 +2411,207 @@ describe('startExpiredFileSweep', () => {
       }),
     );
     expect(interval).toBe('sweep-interval');
+  });
+});
+
+describe('unreachable unified uploads', () => {
+  const makeUnreachableReq = () => {
+    const req = makeReq({ mimetype: 'application/zip', ocrConfig: null });
+    req.body.endpoint = EModelEndpoint.agents;
+    return req;
+  };
+
+  test('refuses a type no tool can consume', async () => {
+    /* Nothing extracts a zip, so with neither code nor search enabled it would sit in the
+     * composer unreadable while the model answered as though it were available. */
+    await expect(
+      processAgentFileUpload({
+        req: makeUnreachableReq(),
+        res: mockRes,
+        metadata: {
+          agent_id: 'agent-abc',
+          message_file: 'true',
+          file_id: 'file-uuid-zip',
+          agentTools: [],
+        },
+      }),
+    ).rejects.toThrow(/code interpreter or file search/i);
+  });
+
+  test('lets it past the guard when a file tool can consume it', async () => {
+    /* Storage is not wired up in this suite, so the upload still fails further along.
+     * What matters is that it is no longer refused for having no consumer. */
+    const error = await processAgentFileUpload({
+      req: makeUnreachableReq(),
+      res: mockRes,
+      metadata: {
+        agent_id: 'agent-abc',
+        message_file: 'true',
+        file_id: 'file-uuid-zip',
+        agentTools: [EToolResources.execute_code],
+      },
+    }).catch((thrown) => thrown);
+
+    expect(String(error?.message ?? '')).not.toMatch(/code interpreter or file search/i);
+  });
+});
+
+describe('native text fallback', () => {
+  /* The text matcher has to admit the type, or processing refuses before reaching the
+   * reader at all. This mirrors a deployment whose text config accepts these types. */
+  beforeEach(() => {
+    mergeFileConfig.mockReturnValue(
+      makeFileConfig({ textSupportedMimeTypes: [/^image\/png$/, /^text\/plain$/] }),
+    );
+    setupStoredFileUpload();
+  });
+
+  test('does not read a raster image as text when no extractor handles it', async () => {
+    /* An administrator can route images to text; without OCR nothing parses them, and
+     * reading the bytes directly would store mojibake as the file's text. */
+    const { parseText } = require('@librechat/api');
+    const req = makeReq({ mimetype: 'image/png', ocrConfig: null });
+    req.body.endpoint = EModelEndpoint.agents;
+
+    await processAgentFileUpload({
+      req,
+      res: mockRes,
+      metadata: {
+        agent_id: 'agent-abc',
+        message_file: 'true',
+        file_id: 'f-png',
+        tool_resource: 'context',
+      },
+    }).catch(() => {});
+
+    const call = parseText.mock.calls.at(-1)?.[0];
+    expect(call?.allowNativeFallback).toBe(false);
+  });
+
+  test('still reads a text file directly', async () => {
+    const { parseText } = require('@librechat/api');
+    const req = makeReq({ mimetype: 'text/plain', ocrConfig: null });
+    req.body.endpoint = EModelEndpoint.agents;
+
+    await processAgentFileUpload({
+      req,
+      res: mockRes,
+      metadata: {
+        agent_id: 'agent-abc',
+        message_file: 'true',
+        file_id: 'f-txt',
+        tool_resource: 'context',
+      },
+    }).catch(() => {});
+
+    const call = parseText.mock.calls.at(-1)?.[0];
+    expect(call?.allowNativeFallback).toBe(true);
+  });
+});
+
+describe('permanent unified uploads and unknown tool sets', () => {
+  const zipReq = () => {
+    const req = makeReq({ mimetype: 'application/zip', ocrConfig: null });
+    req.body.endpoint = EModelEndpoint.agents;
+    return req;
+  };
+
+  test('does not refuse when the agent tools are unknown', async () => {
+    /* An ephemeral agent has no record to read, so the route reports no tool set and
+     * processing must not conclude that nothing can consume the file. */
+    const error = await processAgentFileUpload({
+      req: zipReq(),
+      res: mockRes,
+      metadata: { agent_id: 'agent-abc', message_file: 'true', file_id: 'f-eph' },
+    }).catch((thrown) => thrown);
+
+    expect(String(error?.message ?? '')).not.toMatch(/code interpreter or file search/i);
+  });
+
+  test('files a permanent upload under the tool that will consume it', async () => {
+    const { addAgentResourceFile } = require('~/models');
+    setupStoredFileUpload();
+    /* The code-env branch streams the upload from disk after this assertion resolves, and
+     * an unhandled stream error would take down the worker. Left in place rather than
+     * cleaned up, since the read happens later than the test body. */
+    jest.requireActual('fs').writeFileSync('/tmp/upload.bin', 'zip');
+
+    await processAgentFileUpload({
+      req: zipReq(),
+      res: mockRes,
+      metadata: {
+        agent_id: 'agent-abc',
+        file_id: 'f-perm',
+        agentTools: [EToolResources.execute_code],
+      },
+    }).catch(() => {});
+
+    expect(addAgentResourceFile).toHaveBeenCalledWith(
+      expect.objectContaining({ tool_resource: EToolResources.execute_code }),
+    );
+  });
+
+  test('refuses a permanent upload that would land on no agent resource', async () => {
+    /* Delivered straight to the model, with no agent resource to hold it, storing it
+     * would report success while leaving the agent without a reference. */
+    const req = makeReq({ mimetype: 'image/png', ocrConfig: null });
+    req.body.endpoint = EModelEndpoint.agents;
+
+    await expect(
+      processAgentFileUpload({
+        req,
+        res: mockRes,
+        metadata: { agent_id: 'agent-abc', file_id: 'f-orphan', agentTools: [] },
+      }),
+    ).rejects.toThrow(/cannot be saved to an agent on their own/i);
+  });
+});
+
+describe('filterFile endpoint resolution', () => {
+  /* getEndpointFileConfig consults endpointType ahead of endpoint, so a composer upload
+   * carrying `agents` would keep the Agents policy and shadow the provider the caller
+   * resolved. */
+  /* mergeFileConfig is mocked here, so these are raw byte values rather than the
+   * megabytes an admin would write. The agents policy refuses the file on size and the
+   * provider policy accepts it, which makes the assertions read as which one governed. */
+  const policyConfig = {
+    ...makeFileConfig(),
+    endpoints: {
+      default: {
+        disabled: false,
+        fileLimit: 10,
+        fileSizeLimit: 1_000_000,
+        totalSizeLimit: 1_000_000,
+        supportedMimeTypes: [/^image\/png$/],
+      },
+      agents: { fileSizeLimit: 1 },
+      'Custom Provider': { fileSizeLimit: 1_000_000 },
+    },
+  };
+
+  const makeFilterReq = (endpointType) => ({
+    body: {
+      endpoint: EModelEndpoint.agents,
+      ...(endpointType ? { endpointType } : {}),
+      file_id: '00000000-0000-4000-8000-000000000000',
+      width: 1,
+      height: 1,
+    },
+    file: { size: 10, mimetype: 'image/png', originalname: 'a.png' },
+    config: {},
+  });
+
+  beforeEach(() => {
+    mergeFileConfig.mockReturnValue(policyConfig);
+  });
+
+  test('applies the resolved provider policy even when the request names an endpoint type', () => {
+    expect(() =>
+      filterFile({ req: makeFilterReq('agents'), image: true, endpoint: 'Custom Provider' }),
+    ).not.toThrow();
+  });
+
+  test('keeps the request endpoint type when no override is given', () => {
+    expect(() => filterFile({ req: makeFilterReq('agents'), image: true })).toThrow(/size limit/i);
   });
 });

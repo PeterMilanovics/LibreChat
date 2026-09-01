@@ -6,7 +6,6 @@ import type { CodeEnvFile } from '@librechat/agents';
 import type { CodeEnvRefUpdate, CodeExecutionRoute, ProvisionService } from './service';
 import type { ProvisionState } from '~/agents/resources';
 import type { ServerRequest } from '~/types';
-import { isAgentScopedFile } from '~/agents/resources';
 import { CREATE_FILE_TOOL_NAME } from '~/agents/tools';
 
 /** Deferred database write produced by a successful provisioning call. */
@@ -51,6 +50,8 @@ export interface ProvisionCallbackDeps {
   provisionToVectorDB: ProvisionService['provisionToVectorDB'];
   updateFile: (update: FileUpdate) => Promise<unknown>;
   updateCodeEnvRef: (update: CodeEnvRefUpdate) => Promise<unknown>;
+  /** Records one vector namespace without disturbing the others already recorded. */
+  addEmbeddedEntity: (update: { file_id: string; entityId: string }) => Promise<unknown>;
 }
 
 /**
@@ -97,6 +98,7 @@ export function createProvisionFilesCallback({
   provisionToVectorDB,
   updateFile,
   updateCodeEnvRef,
+  addEmbeddedEntity,
 }: ProvisionCallbackDeps): (toolNames: string[], agentId?: string) => Promise<CodeEnvFile[]> {
   /* Agents in a handoff or parallel graph are initialized independently over the same
    * request attachments, so each holds its own ProvisionState for the same file. Keyed
@@ -172,10 +174,15 @@ export function createProvisionFilesCallback({
       return [];
     }
 
-    /** Chat attachments and generated code outputs stay in the user's sandbox /
-     *  unscoped vector index; only agent setup files are scoped to the agent. */
+    /** Chat attachments and generated code outputs stay in the user's sandbox and unscoped
+     *  vector index; only this agent's own setup files are scoped to it. Membership decides
+     *  that, not the record's context: a user may attach another agent's setup file to this
+     *  conversation, and provisioning it under this agent would place it in a namespace
+     *  this agent's other users can read. */
     const entityIdForFile = (file: TFile) =>
-      isAgentScopedFile(file) ? resolvedAgentId : undefined;
+      file.file_id && provisionState.agentScopedFileIds.has(file.file_id)
+        ? resolvedAgentId
+        : undefined;
 
     /** Two agents may resolve different code deployments, where the same file genuinely
      *  needs uploading to each, so the destination is part of the sharing key. */
@@ -300,8 +307,15 @@ export function createProvisionFilesCallback({
              * turn rather than this turn's results. Logged, not fatal. */
             if (provisioned.embedded && provisioned.fileUpdate) {
               const update = provisioned.fileUpdate;
+              /* Vectors live under the entity that provisioned them, so the namespace is
+               * recorded alongside the flag. Agents sharing a record, as a duplicate does
+               * with its source, each need their own embedding. */
+              const namespace = entityIdForFile(file);
               await persistWithRetry(
-                () => updateFile(update),
+                () =>
+                  namespace != null
+                    ? addEmbeddedEntity({ file_id: update.file_id, entityId: namespace })
+                    : updateFile(update),
                 (error) =>
                   logger.error(
                     `[provisionFiles] Failed to persist embedding state for file ${update.file_id}`,
@@ -313,12 +327,24 @@ export function createProvisionFilesCallback({
           });
           if (result.embedded) {
             file.embedded = true;
+            const namespace = entityIdForFile(file);
+            if (namespace != null) {
+              const recorded = new Set(file.metadata?.embeddedEntities ?? []);
+              recorded.add(namespace);
+              file.metadata = { ...file.metadata, embeddedEntities: [...recorded] };
+            }
             addProvisionedFile(
               file,
               EToolResources.file_search,
               entityIdForFile(file) !== undefined,
             );
+            return;
           }
+          /* Resolving with embedded false is a normal outcome of the service, returned
+           * when the vector store declines the file, and it means the same thing as a
+           * throw: the vectors are not there. Treated as a failure so the file stays
+           * queued and search does not proceed without it. */
+          throw new Error(`Vector store did not embed "${file.filename}" (${file.file_id})`);
         }),
       );
       results.forEach((result, index) => {

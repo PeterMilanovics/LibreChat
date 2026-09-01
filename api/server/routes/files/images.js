@@ -56,6 +56,14 @@ router.post('/', async (req, res) => {
       agent_id: metadata.agent_id,
       req,
     });
+    /* Carried so processing routes under the same configuration validation used, and so
+     * it can tell whether any enabled tool could consume a file kept off the model path,
+     * both from the one agent read this request already made. */
+    metadata.effectiveEndpoint = effectiveEndpoint;
+    /* Left undefined when no agent record backs this upload, as for an ephemeral agent
+     * that exists only for the request. Processing then cannot judge what tools could
+     * consume the file and does not try. */
+    metadata.agentTools = (await resolveUploadAgent(req, metadata.agent_id))?.tools;
     filterFile({ req, image: true, endpoint: effectiveEndpoint });
 
     /* A unified upload the config routes to text is processed as a context resource, so
@@ -81,8 +89,17 @@ router.post('/', async (req, res) => {
     /* An image the config routes to text delivery has to go through the agent upload
      * path, which extracts and stores the text. The image pipeline would persist the
      * routing without any text, leaving the file out of provider delivery and out of
-     * the text context both. */
-    const takesAgentUploadPath = effectiveToolResource != null;
+     * the text context both.
+     *
+     * A permanent upload against an agent takes that path regardless of what the routing
+     * inferred, because the image pipeline always stores a message attachment and never
+     * files anything against the agent. Sent here it would report success while leaving
+     * an orphan, so it goes where that is decided rather than assumed. */
+    const isPermanentAgentUpload =
+      metadata.agent_id != null &&
+      metadata.message_file !== true &&
+      metadata.message_file !== 'true';
+    const takesAgentUploadPath = effectiveToolResource != null || isPermanentAgentUpload;
 
     if (!isAssistantsEndpoint(metadata.endpoint) && takesAgentUploadPath) {
       /* Capability holders bypass agent ACLs on writes, as the sibling `/files` route
