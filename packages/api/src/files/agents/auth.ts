@@ -18,6 +18,10 @@ export interface AgentUploadAuthParams {
 }
 
 export interface AgentUploadAuthDeps {
+  /** Resolves whether the caller may bypass the agent ACL on writes. Consulted only
+   *  after the agent is known to exist, so a bypass cannot let a stale agent id reach
+   *  processing and fail late, and a check that throws denies rather than grants. */
+  hasUploadBypass?: () => Promise<boolean>;
   getAgent: (params: { id: string }) => Promise<{
     _id: string | Types.ObjectId;
     author?: string | Types.ObjectId | null;
@@ -36,7 +40,7 @@ export async function checkAgentUploadAuth(
   deps: AgentUploadAuthDeps,
 ): Promise<AgentUploadAuthResult> {
   const { userId, userRole, agentId, messageFile } = params;
-  const { getAgent, checkPermission } = deps;
+  const { getAgent, checkPermission, hasUploadBypass } = deps;
 
   const isMessageAttachment = messageFile === true || messageFile === 'true';
   /* Any permanent upload against an agent can mutate that agent's resources, so it
@@ -48,13 +52,28 @@ export async function checkAgentUploadAuth(
     return { allowed: true };
   }
 
+  /* Existence is established before any privilege shortcut. Returning early for a
+   * privileged caller would let a stale agent id through to extraction and storage,
+   * surfacing as a late 500 with the remote artifact already written. */
+  const agent = await getAgent({ id: agentId });
+  if (!agent) {
+    return { allowed: false, status: 404, error: 'Not Found', message: 'Agent not found' };
+  }
+
   if (userRole === SystemRoles.ADMIN) {
     return { allowed: true };
   }
 
-  const agent = await getAgent({ id: agentId });
-  if (!agent) {
-    return { allowed: false, status: 404, error: 'Not Found', message: 'Agent not found' };
+  if (hasUploadBypass) {
+    let bypassed = false;
+    try {
+      bypassed = await hasUploadBypass();
+    } catch (error) {
+      logger.warn('[agentUploadAuth] Capability check failed, denying bypass:', error);
+    }
+    if (bypassed) {
+      return { allowed: true };
+    }
   }
 
   if (agent.author?.toString() === userId) {
@@ -91,12 +110,14 @@ export async function verifyAgentUploadPermission({
   metadata,
   getAgent,
   checkPermission,
+  hasUploadBypass,
 }: {
   req: ServerRequest;
   res: Response;
   metadata: { agent_id?: string; tool_resource?: string | null; message_file?: boolean | string };
   getAgent: AgentUploadAuthDeps['getAgent'];
   checkPermission: AgentUploadAuthDeps['checkPermission'];
+  hasUploadBypass?: AgentUploadAuthDeps['hasUploadBypass'];
 }): Promise<boolean> {
   const user = req.user as IUser;
   const result = await checkAgentUploadAuth(
@@ -107,7 +128,7 @@ export async function verifyAgentUploadPermission({
       toolResource: metadata.tool_resource,
       messageFile: metadata.message_file,
     },
-    { getAgent, checkPermission },
+    { getAgent, checkPermission, hasUploadBypass },
   );
 
   if (!result.allowed) {

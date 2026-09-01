@@ -37,6 +37,55 @@ describe('checkAgentUploadAuth', () => {
     expect(result.allowed).toBe(true);
   });
 
+  it('lets a capability holder bypass the ACL', async () => {
+    const result = await checkAgentUploadAuth(
+      { userId: 'manager-id', userRole: SystemRoles.USER, agentId: 'victim-agent' },
+      { getAgent, checkPermission, hasUploadBypass: jest.fn().mockResolvedValue(true) },
+    );
+
+    expect(result.allowed).toBe(true);
+    expect(checkPermission).not.toHaveBeenCalled();
+  });
+
+  it('reports a missing agent even to a caller holding the bypass', async () => {
+    /* The bypass waives the ACL decision, not the agent's existence: letting a stale id
+     * through would surface as a late failure once processing has already written the
+     * file to remote storage. */
+    getAgent.mockResolvedValue(null);
+
+    const result = await checkAgentUploadAuth(
+      { userId: 'manager-id', userRole: SystemRoles.USER, agentId: 'missing-agent' },
+      { getAgent, checkPermission, hasUploadBypass: jest.fn().mockResolvedValue(true) },
+    );
+
+    expect(result).toMatchObject({ allowed: false, status: 404 });
+  });
+
+  it('reports a missing agent to an admin rather than proceeding', async () => {
+    getAgent.mockResolvedValue(null);
+
+    const result = await checkAgentUploadAuth(
+      { userId: 'admin-id', userRole: SystemRoles.ADMIN, agentId: 'missing-agent' },
+      { getAgent, checkPermission },
+    );
+
+    expect(result).toMatchObject({ allowed: false, status: 404 });
+  });
+
+  it('denies the bypass when the capability check throws', async () => {
+    const result = await checkAgentUploadAuth(
+      { userId: 'manager-id', userRole: SystemRoles.USER, agentId: 'victim-agent' },
+      {
+        getAgent,
+        checkPermission,
+        hasUploadBypass: jest.fn().mockRejectedValue(new Error('capability lookup failed')),
+      },
+    );
+
+    expect(result.allowed).toBe(false);
+    expect(checkPermission).toHaveBeenCalled();
+  });
+
   it('allows the agent author without consulting permissions', async () => {
     const result = await checkAgentUploadAuth(
       { userId: 'owner-id', userRole: SystemRoles.USER, agentId: 'own-agent' },

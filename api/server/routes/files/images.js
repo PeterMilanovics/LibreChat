@@ -102,29 +102,16 @@ router.post('/', async (req, res) => {
     const takesAgentUploadPath = effectiveToolResource != null || isPermanentAgentUpload;
 
     if (!isAssistantsEndpoint(metadata.endpoint) && takesAgentUploadPath) {
-      /* Capability holders bypass agent ACLs on writes, as the sibling `/files` route
-       * already does; a failed check denies the bypass rather than granting it. */
-      let skipUploadAuth = false;
-      try {
-        skipUploadAuth = await hasCapability(req.user, SystemCapabilities.MANAGE_AGENTS);
-      } catch (err) {
-        logger.warn(
-          '[/files/images] capability check failed, denying bypass:',
-          getSafeErrorMetadata(err),
-        );
-      }
-
-      if (!skipUploadAuth) {
-        const denied = await verifyAgentUploadPermission({
-          req,
-          res,
-          metadata,
-          getAgent: ({ id }) => resolveUploadAgent(req, id),
-          checkPermission,
-        });
-        if (denied) {
-          return;
-        }
+      const denied = await verifyAgentUploadPermission({
+        req,
+        res,
+        metadata,
+        getAgent: ({ id }) => resolveUploadAgent(req, id),
+        checkPermission,
+        hasUploadBypass: () => hasCapability(req.user, SystemCapabilities.MANAGE_AGENTS),
+      });
+      if (denied) {
+        return;
       }
 
       openSseStreamIfRequested();

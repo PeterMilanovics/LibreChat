@@ -777,24 +777,16 @@ router.post('/', async (req, res) => {
       return await processFileUpload({ req, res, metadata, sseStream });
     }
 
-    let skipUploadAuth = false;
-    try {
-      skipUploadAuth = await hasCapability(req.user, SystemCapabilities.MANAGE_AGENTS);
-    } catch (err) {
-      logger.warn('[/files] capability check failed, denying bypass:', getSafeErrorMetadata(err));
-    }
-
-    if (!skipUploadAuth) {
-      const denied = await verifyAgentUploadPermission({
-        req,
-        res,
-        metadata,
-        getAgent: ({ id }) => resolveUploadAgent(req, id),
-        checkPermission,
-      });
-      if (denied) {
-        return;
-      }
+    const denied = await verifyAgentUploadPermission({
+      req,
+      res,
+      metadata,
+      getAgent: ({ id }) => resolveUploadAgent(req, id),
+      checkPermission,
+      hasUploadBypass: () => hasCapability(req.user, SystemCapabilities.MANAGE_AGENTS),
+    });
+    if (denied) {
+      return;
     }
 
     openSseStreamIfRequested();
