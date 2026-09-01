@@ -143,61 +143,6 @@ jest.mock('@librechat/api', () => {
     }),
     sweepExpiredFiles: jest.fn().mockResolvedValue({ scanned: 0, deleted: 0, failed: 0 }),
     startExpiredFileSweep: jest.fn().mockReturnValue('sweep-interval'),
-    /* Composed from the real data-provider resolvers rather than stubbed, so delivery
-     * path and resource promotion stay genuine here. The orchestration itself has its
-     * own unit tests in packages/api; loading the real barrel pulls in agents runtime
-     * classes this suite does not otherwise need. */
-    resolveUploadRouting: jest.fn(
-      ({
-        file,
-        requestEndpoint,
-        agentProvider,
-        agentId,
-        toolResource,
-        messageAttachment,
-        fileConfig,
-      }) => {
-        const endpoint = agentProvider || requestEndpoint || undefined;
-        const endpointConfig = actualDataProvider.getEndpointFileConfig({ fileConfig, endpoint });
-        const { EToolResources } = actualDataProvider;
-        let llmDeliveryPath;
-        if (toolResource === EToolResources.context || toolResource === EToolResources.ocr) {
-          llmDeliveryPath = 'text';
-        } else if (
-          toolResource === EToolResources.file_search ||
-          toolResource === EToolResources.execute_code
-        ) {
-          llmDeliveryPath = 'none';
-        } else if (endpointConfig?.legacyFileUploadUX === true) {
-          llmDeliveryPath = 'provider';
-        } else {
-          llmDeliveryPath = actualDataProvider.resolveDefaultLLMDeliveryPath(
-            file.mimetype ?? '',
-            endpointConfig?.defaultLLMDeliveryPath,
-            fileConfig?.defaultLLMDeliveryPath,
-            endpoint,
-          );
-        }
-        let effectiveToolResource =
-          toolResource === EToolResources.ocr
-            ? EToolResources.context
-            : (toolResource ?? undefined);
-        if (!toolResource && llmDeliveryPath === 'text') {
-          effectiveToolResource = EToolResources.context;
-        }
-        return {
-          endpoint,
-          endpointConfig,
-          llmDeliveryPath,
-          effectiveToolResource,
-          requiresExplicitToolResource:
-            agentId != null &&
-            !toolResource &&
-            !messageAttachment &&
-            endpointConfig?.legacyFileUploadUX === true,
-        };
-      },
-    ),
   };
 });
 
@@ -1620,8 +1565,9 @@ describe('processAgentFileUpload', () => {
       );
     });
 
-    test('resolves llmDeliveryPath from the agent provider passed by the route', async () => {
-      const { createFile } = require('~/models');
+    test('resolves llmDeliveryPath from the agent provider config for agent uploads', async () => {
+      const { createFile, getAgent } = require('~/models');
+      getAgent.mockResolvedValueOnce({ provider: 'Custom Provider' });
       const storageUpload = jest.fn().mockResolvedValue({
         filepath: '/uploads/user-123/file-uuid-123__upload.bin',
         bytes: 128,
@@ -1646,9 +1592,9 @@ describe('processAgentFileUpload', () => {
           message_file: 'true',
           file_id: 'file-uuid-123',
         },
-        uploadAgent: { provider: 'Custom Provider' },
       });
 
+      expect(getAgent).toHaveBeenCalledWith({ id: 'agent-abc' });
       expect(createFile).toHaveBeenCalledWith(
         expect.objectContaining({ llmDeliveryPath: 'none' }),
         true,
@@ -1899,8 +1845,9 @@ describe('processImageFile', () => {
     );
   });
 
-  test('resolves llmDeliveryPath from the agent provider passed by the images route', async () => {
-    const { createFile } = require('~/models');
+  test('resolves llmDeliveryPath from the agent provider config for agent image uploads', async () => {
+    const { createFile, getAgent } = require('~/models');
+    getAgent.mockResolvedValueOnce({ provider: 'Custom Provider' });
     const handleImageUpload = jest.fn().mockResolvedValue({
       filepath: '/images/user-123/image.webp',
       bytes: 256,
@@ -1924,9 +1871,9 @@ describe('processImageFile', () => {
         agent_id: 'agent-abc',
         endpoint: EModelEndpoint.agents,
       },
-      uploadAgent: { provider: 'Custom Provider' },
     });
 
+    expect(getAgent).toHaveBeenCalledWith({ id: 'agent-abc' });
     expect(handleImageUpload).toHaveBeenCalledWith(
       expect.objectContaining({ endpoint: EModelEndpoint.agents }),
     );

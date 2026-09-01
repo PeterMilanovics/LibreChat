@@ -12,7 +12,6 @@ const {
   assertUploadContentAllowed,
   hasActiveFilePolicy,
   sanitizeFilename,
-  resolveUploadRouting,
 } = require('@librechat/api');
 const {
   isAssistantsEndpoint,
@@ -24,9 +23,13 @@ const {
   processImageFile,
   filterFile,
 } = require('~/server/services/Files/process');
+const {
+  resolveEffectiveToolResource,
+  resolveUploadEndpoint,
+  resolveUploadAgent,
+} = require('~/server/services/Files/routing');
 const { hasCapability } = require('~/server/middleware/roles/capabilities');
 const { checkPermission } = require('~/server/services/PermissionService');
-const db = require('~/models');
 
 const router = express.Router();
 
@@ -45,39 +48,27 @@ router.post('/', async (req, res) => {
 
   try {
     req.file.originalname = sanitizeFilename(req.file.originalname);
+    /* Agent uploads arrive as `agents` but route by the agent's own provider, so the
+     * provider's configuration has to govern acceptance too. Resolved once here and
+     * reused by routing, authorization and processing below. */
+    const effectiveEndpoint = await resolveUploadEndpoint({
+      endpoint: metadata.endpoint,
+      agent_id: metadata.agent_id,
+      req,
+    });
+    filterFile({ req, image: true, endpoint: effectiveEndpoint });
 
-    /* Same ordering as the file route: resolve the agent once so the provider's limits
-     * govern validation and the preflight sees the effective resource, then hand the
-     * record to authorization rather than reading it again. */
-    const isAgentUpload = !isAssistantsEndpoint(metadata.endpoint);
-    const uploadAgent =
-      isAgentUpload && metadata.agent_id ? await db.getAgent({ id: metadata.agent_id }) : undefined;
-    const uploadRouting = isAgentUpload
-      ? resolveUploadRouting({
-          file: req.file,
-          requestEndpoint: metadata.endpoint,
-          agentProvider: uploadAgent?.provider,
-          agentId: metadata.agent_id,
-          toolResource: metadata.tool_resource,
-          messageAttachment: metadata.message_file === true || metadata.message_file === 'true',
-          fileConfig: mergeFileConfig(req.config?.fileConfig),
-        })
-      : undefined;
-
-    filterFile({ req, image: true, endpointConfig: uploadRouting?.endpointConfig });
-
-    /* An image the config routes to text delivery has to go through the agent upload
-     * path, which extracts and stores the text. The image pipeline would persist the
-     * routing without any text, leaving the file out of provider delivery and out of
-     * the text context both. */
-    const takesAgentUploadPath =
-      metadata.tool_resource != null || uploadRouting?.llmDeliveryPath === 'text';
+    /* A unified upload the config routes to text is processed as a context resource, so
+     * the preflight has to judge that destination. Told only the request's empty tool
+     * resource, it cannot see the extraction step and fail-closes on a derived field it
+     * would in fact be able to inspect. */
+    const effectiveToolResource = await resolveEffectiveToolResource({ req, metadata });
 
     await assertUploadContentAllowed({
       filters: req.config?.filters,
       file: req.file,
-      endpoint: uploadRouting?.endpoint ?? metadata.endpoint,
-      toolResource: uploadRouting ? uploadRouting.effectiveToolResource : metadata.tool_resource,
+      endpoint: metadata.endpoint,
+      toolResource: effectiveToolResource,
       fileConfig: mergeFileConfig(req.config?.fileConfig),
       ocrConfigured: req.config?.ocr != null,
       ragConfigured: !!process.env.RAG_API_URL,
@@ -87,11 +78,13 @@ router.post('/', async (req, res) => {
     metadata.temp_file_id = metadata.file_id;
     metadata.file_id = req.file_id;
 
-    /* Authorize whenever the upload names an agent, not only when it names a tool
-     * resource: message attachments are exempt inside the check, so what remains is
-     * a permanent upload against that agent. The authorized record is reused for
-     * routing so the provider is not read a second time. */
-    if (isAgentUpload && metadata.agent_id != null) {
+    /* An image the config routes to text delivery has to go through the agent upload
+     * path, which extracts and stores the text. The image pipeline would persist the
+     * routing without any text, leaving the file out of provider delivery and out of
+     * the text context both. */
+    const takesAgentUploadPath = effectiveToolResource != null;
+
+    if (!isAssistantsEndpoint(metadata.endpoint) && takesAgentUploadPath) {
       /* Capability holders bypass agent ACLs on writes, as the sibling `/files` route
        * already does; a failed check denies the bypass rather than granting it. */
       let skipUploadAuth = false;
@@ -105,27 +98,24 @@ router.post('/', async (req, res) => {
       }
 
       if (!skipUploadAuth) {
-        const { denied } = await verifyAgentUploadPermission({
+        const denied = await verifyAgentUploadPermission({
           req,
           res,
           metadata,
-          agent: uploadAgent ?? null,
-          getAgent: db.getAgent,
+          getAgent: ({ id }) => resolveUploadAgent(req, id),
           checkPermission,
         });
         if (denied) {
           return;
         }
       }
-    }
 
-    if (isAgentUpload && takesAgentUploadPath) {
       openSseStreamIfRequested();
-      return await processAgentFileUpload({ req, res, metadata, sseStream, uploadAgent });
+      return await processAgentFileUpload({ req, res, metadata, sseStream });
     }
 
     openSseStreamIfRequested();
-    await processImageFile({ req, res, metadata, sseStream, uploadAgent });
+    await processImageFile({ req, res, metadata, sseStream });
   } catch (error) {
     // TODO: delete remote file if it exists
     logger.error('[/files/images] Error processing file:', getSafeErrorMetadata(error));

@@ -41,15 +41,35 @@ export function filterFilesByEndpointConfig(
 }
 
 /** Request-free endpoint file-policy adapter used by Agent execution hosts. */
+/**
+ * Whether this endpoint still presents the explicit upload-destination chooser. In that
+ * mode the destination is the user's choice and the upload path acts on it immediately,
+ * so nothing may be provisioned to a service they did not select.
+ */
+export function isLegacyFileUploadUX(
+  appConfig: AppConfig | undefined,
+  params: { endpoint?: string | null; endpointType?: string | null },
+): boolean {
+  const endpointFileConfig = getEndpointFileConfig({
+    fileConfig: mergeFileConfig(appConfig?.fileConfig),
+    endpoint: params.endpoint,
+    endpointType: params.endpointType,
+  });
+  return endpointFileConfig?.legacyFileUploadUX === true;
+}
+
 export function filterFilesByEndpointRuntimeConfig(
   appConfig: AppConfig | undefined,
   params: {
     files: IMongoFile[] | undefined;
     endpoint?: string | null;
     endpointType?: string | null;
+    /** Bytes already committed by an earlier call, so a request split across several
+     *  sets spends one shared `totalSizeLimit` instead of restarting it per set. */
+    consumedBytes?: number;
   },
 ): IMongoFile[] {
-  const { files, endpoint, endpointType } = params;
+  const { files, endpoint, endpointType, consumedBytes = 0 } = params;
 
   if (!files || files.length === 0) {
     return [];
@@ -91,7 +111,7 @@ export function filterFilesByEndpointRuntimeConfig(
 
   /** Filter by total size limit - keep files until total exceeds limit */
   if (totalSizeLimit !== undefined && totalSizeLimit > 0) {
-    let totalSize = 0;
+    let totalSize = consumedBytes;
     const withinTotalLimit: IMongoFile[] = [];
 
     for (let i = 0; i < filteredFiles.length; i++) {

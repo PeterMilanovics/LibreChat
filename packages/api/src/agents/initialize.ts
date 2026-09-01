@@ -100,12 +100,12 @@ import {
 } from './errors';
 import { extractAgentContent, extractSkillContent } from '../protection/adapters/submissions';
 import { createConfiguredContentInspector, inspectContent } from '../protection/runtime';
+import { filterFilesByEndpointRuntimeConfig, isLegacyFileUploadUX } from '~/files';
 import { assertModelBoundContent } from '../middleware/modelBoundContent';
 import { registerMemoryTools, memoryToolUsageGuard } from './memory';
 import { applyIntentLabels, sanitizeIntentLabels } from './intent';
 import { ContentFilterError } from '../middleware/contentFilter';
 import { createRequestAgentExecutionContext } from './runtime';
-import { filterFilesByEndpointRuntimeConfig } from '~/files';
 import { PARTIAL_RESOLVED_CONVERSATION } from './guard';
 import { applyBackgroundToolCalls } from './background';
 import { generateArtifactsPrompt } from '~/prompts';
@@ -679,7 +679,7 @@ export interface InitializeAgentDbMethods extends EndpointDbMethods {
   getDeferredProvisionFiles?: (
     fileIds: string[],
     ownerScope: FileOwnerScope,
-    resources?: { code?: boolean; search?: boolean },
+    resources?: { code?: boolean; search?: boolean; codeRouteKey?: string },
   ) => Promise<unknown[]>;
   /** Get messages for a conversation (supports select for field projection) */
   getMessages?: (
@@ -1089,8 +1089,12 @@ export async function initializeAgent(
      * `previous_response_id`, and chat completions may send `conversation_id` alone. There
      * is no branch to walk in either case, so the conversation's own file refs are both the
      * correct scope and the only one available. Without this the deferred lookup never runs
-     * there, and a later code or search call executes without the attachment. */
-    const provisionFileIds = threadFileIds && threadFileIds.length > 0 ? threadFileIds : fileIds;
+     * there, and a later code or search call executes without the attachment.
+     *
+     * An anchored walk keeps its own result even when empty. Widening a branch that
+     * references no files to the whole conversation would provision a sibling branch's
+     * attachments, sending files this branch never mentioned to the Code API or RAG. */
+    const provisionFileIds = threadAnchor == null ? fileIds : (threadFileIds ?? []);
 
     /**
      * Retrieve execute_code files filtered to the current thread.
@@ -1134,6 +1138,8 @@ export async function initializeAgent(
         ? (db.getDeferredProvisionFiles(provisionFileIds, requestFileOwnerScope, {
             code: wantsCodeFiles,
             search: wantsSearchFiles,
+            codeRouteKey:
+              codeExecutionContext.executionRouteKey ?? codeExecutionContext.executionProfile,
           }) as Promise<IMongoFile[]>)
         : ([] as IMongoFile[]),
     ]);
@@ -1199,11 +1205,17 @@ export async function initializeAgent(
     currentFiles = requestUsageFiles.concat(toolUsageFiles);
   }
 
+  let endpointFileType: EModelEndpoint | undefined;
+  if (!paramEndpoints.has(agent.endpoint ?? '')) {
+    endpointFileType = EModelEndpoint.custom;
+  }
+  const legacyFileUploadUX = isLegacyFileUploadUX(appConfig, {
+    endpoint: agent.endpoint ?? '',
+    endpointType: endpointFileType,
+  });
+
   if ((currentFiles && currentFiles.length) || deferredProvisionFiles.length > 0) {
-    let endpointType: EModelEndpoint | undefined;
-    if (!paramEndpoints.has(agent.endpoint ?? '')) {
-      endpointType = EModelEndpoint.custom;
-    }
+    const endpointType = endpointFileType;
 
     if (currentFiles && currentFiles.length) {
       currentFiles = filterFilesByEndpointRuntimeConfig(appConfig, {
@@ -1217,10 +1229,15 @@ export async function initializeAgent(
      * by size, MIME type, or a files-disabled setting must not reach the Code API or
      * RAG through provisioning just because it left the delivery set. */
     if (deferredProvisionFiles.length > 0) {
+      /* One request, one total-size allowance. Filtering each set from zero would let a
+       * delivery attachment and a provisioning candidate that each fit alone exceed the
+       * limit together once withDeferredCandidates merges them. */
+      const deliveredBytes = (currentFiles ?? []).reduce((sum, file) => sum + (file.bytes ?? 0), 0);
       deferredProvisionFiles = filterFilesByEndpointRuntimeConfig(appConfig, {
         files: deferredProvisionFiles,
         endpoint: agent.endpoint ?? '',
         endpointType,
+        consumedBytes: deliveredBytes,
       }) as IMongoFile[];
     }
   }
@@ -1292,6 +1309,13 @@ export async function initializeAgent(
     checkSessionsAlive: db.checkSessionsAlive,
     loadCodeApiKey: db.loadCodeApiKey,
     provisionCandidates: deferredProvisionFiles as unknown as TFile[],
+    legacyFileUploadUX,
+    filterByEndpointPolicy: (files) =>
+      filterFilesByEndpointRuntimeConfig(appConfig, {
+        files: files as unknown as IMongoFile[],
+        endpoint: agent.endpoint ?? '',
+        endpointType: endpointFileType,
+      }) as unknown as TFile[],
   });
 
   /**

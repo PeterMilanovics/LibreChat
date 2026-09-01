@@ -36,7 +36,6 @@ const {
   contentFilterBlockResponse,
   sweepExpiredFiles: sweepExpiredFilesWithDeps,
   startExpiredFileSweep: startExpiredFileSweepWithDeps,
-  resolveUploadRouting,
 } = require('@librechat/api');
 const {
   convertImage,
@@ -53,6 +52,10 @@ const { getRetentionExpiry, getAgentFileRetentionExpiry } = require('./retention
 const { getStrategyFunctions } = require('./strategies');
 const { determineFileType } = require('~/server/utils');
 const { STTService } = require('./Audio/STTService');
+const {
+  resolveUploadEndpoint,
+  resolveUploadLLMDeliveryPath,
+} = require('~/server/services/Files/routing');
 const db = require('~/models');
 
 /**
@@ -461,27 +464,20 @@ const processFileURL = async ({
  * @param {import('@librechat/api').UploadSseStream | null} [params.sseStream] - Active upload SSE stream, if enabled.
  * @returns {Promise<void>}
  */
-const processImageFile = async ({
-  req,
-  res,
-  metadata,
-  returnFile = false,
-  sseStream,
-  uploadAgent,
-}) => {
+const processImageFile = async ({ req, res, metadata, returnFile = false, sseStream }) => {
   const { file } = req;
   const appConfig = req.config;
   const source = getFileStrategy(appConfig, { isImage: true });
   const { handleImageUpload } = getStrategyFunctions(source);
   const { file_id, temp_file_id, endpoint, agent_id } = metadata;
   const fileConfig = mergeFileConfig(appConfig?.fileConfig);
-  const { llmDeliveryPath } = resolveUploadRouting({
+  const configEndpoint = await resolveUploadEndpoint({ endpoint, agent_id, req });
+  const endpointConfig = getEndpointFileConfig({ fileConfig, endpoint: configEndpoint });
+  const llmDeliveryPath = resolveUploadLLMDeliveryPath({
     file,
-    requestEndpoint: endpoint,
-    agentProvider: uploadAgent?.provider,
-    agentId: agent_id,
-    messageAttachment: metadata.message_file === true || metadata.message_file === 'true',
+    endpointConfig,
     fileConfig,
+    endpoint: configEndpoint,
   });
 
   const { filepath, bytes, width, height, storageKey, storageRegion } = await handleImageUpload({
@@ -694,7 +690,7 @@ const processFileUpload = async ({ req, res, metadata, sseStream }) => {
  * @param {import('@librechat/api').UploadSseStream | null} [params.sseStream] - Active upload SSE stream, if enabled.
  * @returns {Promise<void>}
  */
-const processAgentFileUpload = async ({ req, res, metadata, sseStream, uploadAgent }) => {
+const processAgentFileUpload = async ({ req, res, metadata, sseStream }) => {
   // TODO: check and potentially fix — deferred/provider files may be orphaned if effectiveToolResource is undefined
   const { file } = req;
   const appConfig = req.config;
@@ -702,21 +698,29 @@ const processAgentFileUpload = async ({ req, res, metadata, sseStream, uploadAge
 
   let messageAttachment = !!metadata.message_file;
 
-  const fileConfig = mergeFileConfig(appConfig?.fileConfig);
-  const routing = resolveUploadRouting({
-    file,
-    requestEndpoint: req.body?.endpoint,
-    agentProvider: uploadAgent?.provider,
-    agentId: agent_id,
-    toolResource: tool_resource,
-    messageAttachment,
-    fileConfig,
-  });
-  const { llmDeliveryPath } = routing;
-  let effectiveToolResource = routing.effectiveToolResource;
+  let effectiveToolResource =
+    tool_resource === EToolResources.ocr ? EToolResources.context : tool_resource;
 
-  if (routing.requiresExplicitToolResource) {
-    throw new Error('No tool resource provided for agent file upload');
+  const fileConfig = mergeFileConfig(appConfig?.fileConfig);
+  const endpoint = await resolveUploadEndpoint({ endpoint: req.body?.endpoint, agent_id, req });
+  const endpointConfig = getEndpointFileConfig({ fileConfig, endpoint });
+
+  if (agent_id && !tool_resource && !messageAttachment) {
+    if (endpointConfig?.legacyFileUploadUX === true) {
+      throw new Error('No tool resource provided for agent file upload');
+    }
+  }
+
+  const llmDeliveryPath = resolveUploadLLMDeliveryPath({
+    tool_resource,
+    file,
+    endpointConfig,
+    fileConfig,
+    endpoint,
+  });
+
+  if (!tool_resource && llmDeliveryPath === 'text') {
+    effectiveToolResource = EToolResources.context;
   }
 
   if (effectiveToolResource === EToolResources.file_search && file.mimetype.startsWith('image')) {
@@ -1411,13 +1415,18 @@ async function saveBase64Image(
  */
 /**
  * @param {object} params
- * @param {object} [params.endpointConfig] - Effective config resolved from the agent's
- *   provider. Without it the posted endpoint governs, which for an agent upload is the
- *   generic `agents` entry rather than the provider actually receiving the file.
+ * @param {ServerRequest} params.req
+ * @param {boolean} [params.image]
+ * @param {boolean} [params.isAvatar]
+ * @param {string} [params.endpoint] Effective endpoint for this upload. Agent uploads
+ *   arrive as `agents` but route by the agent's own provider, so validation has to be
+ *   told which configuration governs, or it admits files the provider rejects and
+ *   rejects files the provider allows.
  */
-function filterFile({ req, image, isAvatar, endpointConfig }) {
+function filterFile({ req, image, isAvatar, endpoint: endpointOverride }) {
   const { file } = req;
-  const { endpoint, endpointType, file_id, width, height } = req.body;
+  const { endpoint: requestEndpoint, endpointType, file_id, width, height } = req.body;
+  const endpoint = endpointOverride ?? requestEndpoint;
 
   if (!file_id && !isAvatar) {
     throw new Error('No file_id provided');
@@ -1439,13 +1448,11 @@ function filterFile({ req, image, isAvatar, endpointConfig }) {
   const appConfig = req.config;
   const fileConfig = mergeFileConfig(appConfig.fileConfig);
 
-  const endpointFileConfig =
-    endpointConfig ??
-    getEndpointFileConfig({
-      endpoint,
-      fileConfig,
-      endpointType,
-    });
+  const endpointFileConfig = getEndpointFileConfig({
+    endpoint,
+    fileConfig,
+    endpointType,
+  });
 
   /* Avatars are not endpoint-scoped, so the flag only governs endpoint uploads. For an
    * agent upload this is the resolved provider's config, which is the point: a provider

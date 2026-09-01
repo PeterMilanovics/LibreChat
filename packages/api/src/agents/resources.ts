@@ -326,6 +326,7 @@ const computeProvisionState = async ({
   processedResourceFiles,
   checkSessionsAlive,
   loadCodeApiKey,
+  legacyFileUploadUX,
 }: {
   req?: ServerRequest;
   attachments: Array<TFile>;
@@ -335,8 +336,17 @@ const computeProvisionState = async ({
   processedResourceFiles: Set<string>;
   checkSessionsAlive?: TCheckSessionsAlive;
   loadCodeApiKey?: TLoadCodeApiKey;
+  legacyFileUploadUX?: boolean;
 }): Promise<ProvisionState | undefined> => {
   if (!enabledToolResources || enabledToolResources.size === 0 || attachments.length === 0) {
+    return undefined;
+  }
+
+  /* The legacy chooser makes the destination an explicit user decision that the upload
+   * path already acted on, so a file carries no reference for the destinations the user
+   * declined. Queueing on a missing reference would read those declines as work to do
+   * and send the contents to a service the user did not pick. */
+  if (legacyFileUploadUX === true) {
     return undefined;
   }
 
@@ -469,6 +479,8 @@ export const primeResources = async ({
   checkSessionsAlive,
   loadCodeApiKey,
   provisionCandidates,
+  legacyFileUploadUX,
+  filterByEndpointPolicy,
 }: {
   req?: ServerRequest;
   principal?: Pick<IUser, 'id' | 'role'>;
@@ -489,6 +501,13 @@ export const primeResources = async ({
    *  provisioning only and never returned as attachments: re-delivering an earlier
    *  upload to the model on every later turn is not the intent. */
   provisionCandidates?: Array<TFile>;
+  /** True when this endpoint still shows the explicit upload-destination chooser. */
+  legacyFileUploadUX?: boolean;
+  /** Applies the current endpoint's file policy. Persistent agent files are read here
+   *  rather than by the caller, so the caller has no chance to filter them itself and
+   *  a provider or policy change since they were attached would otherwise let their
+   *  bytes reach the Code API or RAG. */
+  filterByEndpointPolicy?: (files: Array<TFile>) => Array<TFile>;
 }): Promise<{
   attachments: Array<TFile | undefined> | undefined;
   requestAttachments: Array<TFile | undefined> | undefined;
@@ -597,6 +616,10 @@ export const primeResources = async ({
           agentId,
         });
       }
+
+      if (filterByEndpointPolicy) {
+        persistedResourceFiles = filterByEndpointPolicy(persistedResourceFiles);
+      }
     }
 
     for (const file of persistedResourceFiles) {
@@ -643,6 +666,7 @@ export const primeResources = async ({
         processedResourceFiles,
         checkSessionsAlive,
         loadCodeApiKey,
+        legacyFileUploadUX,
       });
       return {
         attachments: attachments.length > 0 ? attachments : undefined,
@@ -697,6 +721,7 @@ export const primeResources = async ({
       processedResourceFiles,
       checkSessionsAlive,
       loadCodeApiKey,
+      legacyFileUploadUX,
     });
 
     return {
