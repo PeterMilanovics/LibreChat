@@ -736,6 +736,25 @@ router.post('/', async (req, res) => {
 
   try {
     req.file.originalname = sanitizeFilename(req.file.originalname);
+    const isAssistants = isAssistantsEndpoint(metadata.endpoint);
+
+    /* Authorization runs before anything reads the target agent. Validating against a
+     * record the caller cannot access answers with that agent's provider limits and
+     * content policy, so the rejection itself reports its configuration. */
+    if (!isAssistants) {
+      const denied = await verifyAgentUploadPermission({
+        req,
+        res,
+        metadata,
+        getAgent: ({ id }) => resolveUploadAgent(req, id),
+        checkPermission,
+        hasUploadBypass: () => hasCapability(req.user, SystemCapabilities.MANAGE_AGENTS),
+      });
+      if (denied) {
+        return;
+      }
+    }
+
     /* Same configuration for validation and routing: an agent upload arrives as
      * `agents` but is processed under the agent's own provider. */
     const effectiveEndpoint = await resolveUploadEndpoint({
@@ -772,21 +791,9 @@ router.post('/', async (req, res) => {
     metadata.temp_file_id = metadata.file_id;
     metadata.file_id = req.file_id;
 
-    if (isAssistantsEndpoint(metadata.endpoint)) {
+    if (isAssistants) {
       openSseStreamIfRequested();
       return await processFileUpload({ req, res, metadata, sseStream });
-    }
-
-    const denied = await verifyAgentUploadPermission({
-      req,
-      res,
-      metadata,
-      getAgent: ({ id }) => resolveUploadAgent(req, id),
-      checkPermission,
-      hasUploadBypass: () => hasCapability(req.user, SystemCapabilities.MANAGE_AGENTS),
-    });
-    if (denied) {
-      return;
     }
 
     openSseStreamIfRequested();
