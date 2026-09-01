@@ -2822,6 +2822,154 @@ describe('Code Process', () => {
       mockAxios.mockReset();
     });
 
+    it('reuses the exact artifact preflight buffer without calling /exec', async () => {
+      const req = {
+        user: { id: 'artifact-user' },
+        config: mockReq.config,
+      };
+      const source = Buffer.concat([PNG_HEADER, crypto.randomBytes(1024)]);
+      mockAxios.mockResolvedValueOnce({ data: source });
+      determineFileType.mockResolvedValueOnce({ mime: 'image/png' });
+
+      await prepareCodeOutputForInspection({
+        ...baseParams,
+        req,
+        id: 'artifact-file',
+        name: 'charts/result.png',
+        session_id: 'artifact-session',
+      });
+      expect(mockAxios).toHaveBeenCalledTimes(1);
+      expect(mockAxios.mock.calls[0][0].method).toBe('get');
+      mockAxios.mockClear();
+
+      const result = await readSandboxImage({
+        req,
+        file_path: '/mnt/data/charts/result.png',
+        session_id: 'runtime-session',
+        files: [
+          {
+            id: 'artifact-file',
+            name: 'charts/result.png',
+            storage_session_id: 'artifact-session',
+          },
+        ],
+      });
+
+      expect(mockAxios).not.toHaveBeenCalled();
+      expect(result.bytes).toBe(source.length);
+      expect(Buffer.from(result.base64, 'base64').equals(source)).toBe(true);
+    });
+
+    it('does not reuse a same-path buffer for a different artifact ref', async () => {
+      const req = {
+        user: { id: 'artifact-user' },
+        config: mockReq.config,
+      };
+      const stale = Buffer.concat([PNG_HEADER, crypto.randomBytes(64)]);
+      const current = Buffer.concat([PNG_HEADER, crypto.randomBytes(128)]);
+      mockAxios.mockResolvedValueOnce({ data: stale });
+      determineFileType.mockResolvedValueOnce({ mime: 'image/png' });
+      await prepareCodeOutputForInspection({
+        ...baseParams,
+        req,
+        id: 'stale-file',
+        name: 'chart.png',
+        session_id: 'artifact-session',
+      });
+      mockAxios.mockReset();
+      serveFile(current);
+
+      const result = await readSandboxImage({
+        req,
+        file_path: '/mnt/data/chart.png',
+        files: [
+          {
+            id: 'current-file',
+            name: 'chart.png',
+            storage_session_id: 'artifact-session',
+          },
+        ],
+      });
+
+      expect(mockAxios).toHaveBeenCalledTimes(1);
+      expect(mockAxios.mock.calls[0][0].method).toBe('post');
+      expect(Buffer.from(result.base64, 'base64').equals(current)).toBe(true);
+    });
+
+    it('does not reuse an exact artifact ref across requests', async () => {
+      const ownerReq = {
+        user: { id: 'artifact-user' },
+        config: mockReq.config,
+      };
+      const otherReq = {
+        user: { id: 'other-user' },
+        config: mockReq.config,
+      };
+      const cached = Buffer.concat([PNG_HEADER, crypto.randomBytes(64)]);
+      const current = Buffer.concat([PNG_HEADER, crypto.randomBytes(128)]);
+      mockAxios.mockResolvedValueOnce({ data: cached });
+      determineFileType.mockResolvedValueOnce({ mime: 'image/png' });
+      await prepareCodeOutputForInspection({
+        ...baseParams,
+        req: ownerReq,
+        id: 'artifact-file',
+        name: 'chart.png',
+        session_id: 'artifact-session',
+      });
+      mockAxios.mockReset();
+      serveFile(current);
+
+      const result = await readSandboxImage({
+        req: otherReq,
+        file_path: '/mnt/data/chart.png',
+        files: [
+          {
+            id: 'artifact-file',
+            name: 'chart.png',
+            storage_session_id: 'artifact-session',
+          },
+        ],
+      });
+
+      expect(mockAxios).toHaveBeenCalledTimes(1);
+      expect(mockAxios.mock.calls[0][0].method).toBe('post');
+      expect(Buffer.from(result.base64, 'base64').equals(current)).toBe(true);
+    });
+
+    it('applies the inline byte limit before returning a prepared artifact buffer', async () => {
+      const req = {
+        user: { id: 'artifact-user' },
+        config: mockReq.config,
+      };
+      const source = Buffer.concat([PNG_HEADER, crypto.randomBytes(128)]);
+      mockAxios.mockResolvedValueOnce({ data: source });
+      determineFileType.mockResolvedValueOnce({ mime: 'image/png' });
+      await prepareCodeOutputForInspection({
+        ...baseParams,
+        req,
+        id: 'large-file',
+        name: 'large.png',
+        session_id: 'artifact-session',
+      });
+      mockAxios.mockClear();
+
+      const result = await readSandboxImage({
+        req,
+        file_path: '/mnt/data/large.png',
+        maxBytes: 64,
+        files: [
+          {
+            id: 'large-file',
+            name: 'large.png',
+            storage_session_id: 'artifact-session',
+          },
+        ],
+      });
+
+      expect(result).toEqual({ tooLarge: true, reason: 'size', bytes: source.length });
+      expect(mockAxios).not.toHaveBeenCalled();
+    });
+
     it('reassembles an image larger than one chunk, byte-for-byte', async () => {
       /* 200KB of PNG-headed noise: > 6 chunks at the 32KB default, and the
        * exact shape that used to blow the stdout cap and SIGKILL the job. */

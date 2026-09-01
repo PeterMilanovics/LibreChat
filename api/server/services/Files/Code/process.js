@@ -54,6 +54,83 @@ const { determineFileType } = require('~/server/utils');
 
 const axios = createAxiosInstance();
 
+/** Request-scoped references to buffers already fetched by artifact preflight.
+ * The request object is the ownership boundary, and WeakMap keeps completed
+ * requests from retaining generated-file bytes. */
+const preparedCodeOutputBuffers = new WeakMap();
+
+const codeOutputBufferKey = (sessionId, fileId) => `${sessionId}\0${fileId}`;
+
+const normalizeSandboxArtifactName = (filePath) => {
+  if (typeof filePath !== 'string' || filePath.length === 0) {
+    return null;
+  }
+  const posixPath = filePath.replace(/\\/g, '/');
+  let relativePath = posixPath;
+  if (posixPath.startsWith('/mnt/data/')) {
+    relativePath = posixPath.slice('/mnt/data/'.length);
+  } else if (posixPath.startsWith('/')) {
+    return null;
+  }
+  const normalized = path.posix.normalize(relativePath).replace(/^\.\//, '');
+  if (
+    normalized.length === 0 ||
+    normalized === '.' ||
+    normalized === '..' ||
+    normalized.startsWith('../')
+  ) {
+    return null;
+  }
+  return normalized;
+};
+
+const cachePreparedCodeOutputBuffer = ({ req, id, name, session_id, buffer }) => {
+  if (
+    !req ||
+    (typeof req !== 'object' && typeof req !== 'function') ||
+    typeof id !== 'string' ||
+    typeof session_id !== 'string' ||
+    !Buffer.isBuffer(buffer)
+  ) {
+    return;
+  }
+  let buffers = preparedCodeOutputBuffers.get(req);
+  if (!buffers) {
+    buffers = new Map();
+    preparedCodeOutputBuffers.set(req, buffers);
+  }
+  buffers.set(codeOutputBufferKey(session_id, id), { name, buffer });
+};
+
+const getPreparedCodeOutputBuffer = ({ req, file_path, session_id, files }) => {
+  if (!req || (typeof req !== 'object' && typeof req !== 'function') || !Array.isArray(files)) {
+    return null;
+  }
+  const buffers = preparedCodeOutputBuffers.get(req);
+  const requestedName = normalizeSandboxArtifactName(file_path);
+  if (!buffers || !requestedName) {
+    return null;
+  }
+
+  for (const file of files) {
+    if (!file || typeof file.id !== 'string' || typeof file.name !== 'string') {
+      continue;
+    }
+    if (normalizeSandboxArtifactName(file.name) !== requestedName) {
+      continue;
+    }
+    const storageSessionId = file.storage_session_id ?? file.session_id ?? session_id;
+    if (typeof storageSessionId !== 'string') {
+      continue;
+    }
+    const cached = buffers.get(codeOutputBufferKey(storageSessionId, file.id));
+    if (cached && normalizeSandboxArtifactName(cached.name) === requestedName) {
+      return cached.buffer;
+    }
+  }
+  return null;
+};
+
 class CodeOutputDownloadLimitError extends Error {
   constructor(maxBytes) {
     super(`Generated file exceeds the ${maxBytes}-byte transport limit`);
@@ -159,6 +236,7 @@ const prepareCodeOutputForInspection = async ({
     codeApiBaseUrl,
     executionProfile,
   });
+  cachePreparedCodeOutputBuffer({ req, id, name, session_id, buffer });
   const safeName = sanitizeArtifactPath(name);
   const fallbackType = inferMimeType(name, '') || 'application/octet-stream';
   if (!inspectContent) {
@@ -1535,8 +1613,11 @@ const SANDBOX_OUTPUT_OVERFLOW = Symbol('sandboxOutputOverflow');
 const learnedImageChunkBytes = new Map();
 
 /**
- * Reads a small image file out of the code-execution sandbox as base64 so
- * `read_file` can surface it to vision-capable models. `readSandboxFile`'s
+ * Reads a small code artifact as base64 so `read_file` can surface it to
+ * vision-capable models. Reuses bytes fetched by the current request's
+ * artifact preflight when the requested path resolves to the exact returned
+ * file ref; otherwise falls back to the code-execution sandbox.
+ * `readSandboxFile`'s
  * `cat` round-trips stdout through codeapi's JSON transport, which lossily
  * replaces non-UTF-8 bytes and corrupts image data. Here a tiny Python
  * reader stats the file, refuses (without transferring) anything over
@@ -1574,12 +1655,25 @@ async function readSandboxImage({
   maxBytes,
   req,
 }) {
+  const limit = typeof maxBytes === 'number' && maxBytes > 0 ? maxBytes : 5 * megabyte;
+  const preparedBuffer = getPreparedCodeOutputBuffer({
+    req,
+    file_path,
+    session_id,
+    files,
+  });
+  if (preparedBuffer) {
+    if (preparedBuffer.length > limit) {
+      return { tooLarge: true, reason: 'size', bytes: preparedBuffer.length };
+    }
+    return { base64: preparedBuffer.toString('base64'), bytes: preparedBuffer.length };
+  }
+
   const baseURL = codeApiBaseUrl ?? getCodeBaseURL();
   if (!baseURL) {
     return null;
   }
 
-  const limit = typeof maxBytes === 'number' && maxBytes > 0 ? maxBytes : 5 * megabyte;
   /** Every chunk is one `/exec` call against the Code API's per-user
    *  execution limiter, so the read shares one wait budget: a window that
    *  resets mid-read is worth pausing for, an exhausted budget is not. */
